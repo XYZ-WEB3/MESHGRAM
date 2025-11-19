@@ -1,0 +1,12 @@
+{
+  "telegram": {
+    "floodwait_threshold": 20
+  },
+  "meshtastic": {
+    "serial_port": "/dev/ttyUSB0",
+    "baudrate": 115200,
+    "throttle_interval": 1.5
+  },
+  "queue_retry_interval": 5.0,
+  "history_hours": 48
+}
