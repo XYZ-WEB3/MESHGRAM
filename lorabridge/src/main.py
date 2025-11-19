@@ -11,6 +11,7 @@ from .telegram.client import TelegramClient
 from .meshtastic.client import MeshtasticClient
 from .user_mapping.manager import UserMappingManager
 from .utils.config import load_settings
+from .utils.setup_wizard import InteractiveSetup
 from .utils.logging import configure_logging
 
 
@@ -25,6 +26,7 @@ def build_cli() -> argparse.ArgumentParser:
 
 
 def run_bridge(base_dir: Path) -> None:
+    InteractiveSetup(base_dir).ensure()
     settings = load_settings(base_dir)
     configure_logging(settings.data_dir / "logs")
     queue = MessageQueue()
@@ -61,6 +63,7 @@ def main() -> None:
     if args.command == "run":
         run_bridge(base_dir)
     elif args.command == "status":
+        InteractiveSetup(base_dir).ensure()
         settings = load_settings(base_dir)
         configure_logging(settings.data_dir / "logs")
         logging.info("Состояние: очередь=%s", settings.queue_retry_interval)
