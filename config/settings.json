@@ -1,0 +1,23 @@
+{
+  "telegram": {
+    "bot_token": "${TELEGRAM_BOT_TOKEN}",
+    "admin_usernames": ["mesh_admin"],
+    "floodwait_padding": 5
+  },
+  "meshtastic": {
+    "serial_port": "/dev/ttyUSB0",
+    "baudrate": 921600,
+    "channel": "LongFast",
+    "throttle_seconds": 2.5
+  },
+  "queue": {
+    "max_retries": 5,
+    "retry_delay": 15,
+    "inbound_limit": 128,
+    "outbound_limit": 128
+  },
+  "storage": {
+    "users_path": "data/users.json",
+    "logs_dir": "data/logs"
+  }
+}
