@@ -1,0 +1,37 @@
+# Secrets / runtime state — never commit
+relay/.env
+relay/relay.db
+relay/relay.db-journal
+relay/relay.db-wal
+relay/relay.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+venv/
+.venv/
+env/
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Build artefacts
+build/
+dist/
+*.spec
+
+# Site deploy local-only state
+meshgram_site/.deploy_state

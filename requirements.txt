@@ -1,0 +1,5 @@
+meshtastic>=2.3.0
+python-telegram-bot>=20.0
+pypubsub
+pyserial>=3.5
+PyQt6>=6.5
