@@ -46,6 +46,12 @@ DEFAULTS: dict[str, Any] = {
     # generic | heltec_v3 | heltec_v3_1 | tbeam | tbeam_supreme | t_echo | t_deck | rak4631 | other
     "node_model":     "generic",
 
+    # --- Mesh ---
+    # hop_limit на исходящих DM. 1 = только прямая видимость (быстрее, без
+    # ретрансляций). Поднять до 3 если pocket-нода может оказаться за углом
+    # и нужны промежуточные ноды-ретрансляторы.
+    "mesh_hop_limit": 1,
+
     # --- Limits ---
     "max_text_length":        170,
     "slot_ttl_hours":         20,
@@ -73,13 +79,20 @@ DEFAULTS: dict[str, Any] = {
     # --- Delivery status / retry ---
     "retry_initial_delay_min":  2,
     "retry_max_interval_min":   15,
+
+    # --- Logging ---
+    # Файл relay.log пишется рядом со скриптом. При log_file_enabled=False
+    # бот пишет только в stdout (что подхватит GUI/journalctl).
+    "log_file_enabled": True,
+    "log_file_max_mb":  5,    # размер одного файла перед ротацией
+    "log_file_keep":    5,    # сколько бэкапов хранить (relay.log.1 .. .5)
 }
 
 
 # Keys grouped for nice .env formatting.
 GROUPS: list[tuple[str, list[str]]] = [
     ("Connection", ["bot_token", "owner_id", "pocket_node_id", "last_com_port",
-                    "display_name", "node_model"]),
+                    "display_name", "node_model", "mesh_hop_limit"]),
     ("Limits", ["max_text_length", "slot_ttl_hours", "slot_sticky_hours",
                 "max_username_in_prefix", "pocket_fresh_min", "pocket_stale_min"]),
     ("GPS (BETA — not tested by author)", [
@@ -89,6 +102,7 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Access", ["whitelist_enabled"]),
     ("SOS", ["sos_enabled", "sos_message", "sos_include_coords", "sos_recipients"]),
     ("Delivery / retry", ["retry_initial_delay_min", "retry_max_interval_min"]),
+    ("Logging", ["log_file_enabled", "log_file_max_mb", "log_file_keep"]),
 ]
 
 
@@ -198,7 +212,10 @@ def validate(data: dict[str, Any]) -> list[str]:
     for key in ("max_text_length", "slot_ttl_hours", "slot_sticky_hours",
                 "pocket_fresh_min", "pocket_stale_min",
                 "gps_fix_fresh_min", "gps_fix_stale_min", "gps_fix_max_min",
-                "where_rate_limit_min", "retry_initial_delay_min", "retry_max_interval_min"):
+                "where_rate_limit_min", "retry_initial_delay_min",
+                "retry_max_interval_min",
+                "log_file_max_mb", "log_file_keep",
+                "mesh_hop_limit"):
         try:
             v = int(s[key])
             if v < 0:

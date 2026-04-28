@@ -57,6 +57,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import Conflict, NetworkError, RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -65,6 +66,16 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+# ===== Auto-restart / polling resiliency =====
+# Сколько ждать перед первым перезапуском после сетевой ошибки в Telegram.
+# Каждый следующий fail удваивает задержку, capped POLLING_RESTART_MAX_SEC.
+# Если бот проработал стабильно >= POLLING_STABLE_RESET_SEC — сбрасываем
+# backoff к initial. Это чтобы редкий разовый NetworkError не раскручивал
+# задержку до 5 минут.
+POLLING_RESTART_INITIAL_SEC: int = 5
+POLLING_RESTART_MAX_SEC:     int = 300
+POLLING_STABLE_RESET_SEC:    int = 60
 
 # ============================================================
 # CONFIG — loaded from .env via settings.py (edit via GUI)
@@ -107,18 +118,58 @@ SOS_INCLUDE_COORDS: bool  = bool(_S["sos_include_coords"])
 RETRY_INITIAL_DELAY_MIN: int = int(_S["retry_initial_delay_min"])
 RETRY_MAX_INTERVAL_MIN: int  = int(_S["retry_max_interval_min"])
 
+# Mesh: hop_limit на исходящих DM. 1 = direct only (без retransmit'ов через
+# другие ноды). Подходит для ближних случаев и снимает 5–15 с ожидания
+# окна ретрансляции. Поднять в .env (MESH_HOP_LIMIT=3) если pocket-нода
+# может оказаться за пределами прямой видимости.
+MESH_HOP_LIMIT: int = int(_S["mesh_hop_limit"])
+
 # SQLite file next to this script.
 DB_PATH: Path = Path(__file__).with_name("relay.db")
 
+# Лог-файл рядом со скриптом. Ротация по размеру: при достижении
+# LOG_FILE_MAX_MB файл переименовывается в .1 (старый .1 → .2 и т.д.),
+# хранится LOG_FILE_KEEP бэкапов. Настраивается в .env.
+LOG_FILE_PATH:    Path = Path(__file__).with_name("relay.log")
+LOG_FILE_ENABLED: bool = bool(_S["log_file_enabled"])
+LOG_FILE_MAX_MB:  int  = int(_S["log_file_max_mb"])
+LOG_FILE_KEEP:    int  = int(_S["log_file_keep"])
+
 # ============================================================
 
-logging.basicConfig(
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    level=logging.INFO,
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("telegram").setLevel(logging.WARNING)
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 
+
+def _setup_logging() -> None:
+    """Ставим stdout-handler через basicConfig + (опционально) ротируемый
+    файловый. httpx/telegram-логгеры приглушены до WARNING — иначе
+    polling спамит DEBUG/INFO про каждый getUpdates."""
+    logging.basicConfig(format=_LOG_FORMAT, level=logging.INFO)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("telegram").setLevel(logging.WARNING)
+
+    if not LOG_FILE_ENABLED:
+        return
+    try:
+        from logging.handlers import RotatingFileHandler
+        fh = RotatingFileHandler(
+            LOG_FILE_PATH,
+            maxBytes=max(1, LOG_FILE_MAX_MB) * 1024 * 1024,
+            backupCount=max(0, LOG_FILE_KEEP),
+            encoding="utf-8",
+        )
+        fh.setFormatter(logging.Formatter(_LOG_FORMAT))
+        fh.setLevel(logging.INFO)
+        logging.getLogger().addHandler(fh)
+    except OSError as e:
+        # Если не можем писать в файл (read-only fs / permission),
+        # продолжаем с одним только stdout. Не падаем.
+        logging.getLogger().warning(
+            "File logging disabled: cannot open %s (%s)", LOG_FILE_PATH, e,
+        )
+
+
+_setup_logging()
 log = logging.getLogger("relay")
 
 
@@ -760,20 +811,42 @@ def on_mesh_receive(packet, interface) -> None:
         log.exception("Error in on_mesh_receive")
 
 
+# Lock на исходящие LoRa-вызовы. Радио всё равно физически передаёт только
+# один пакет в моменте — лок просто матчит реальность и убирает любые гонки
+# на _mesh_iface (USB-write) при конкурентных вызовах из разных asyncio-
+# обработчиков и retry_worker'а. threading.Lock работает и для sync-, и
+# для async-callers (последние используют send_dm_to_pocket_async, который
+# гоняет sendText через asyncio.to_thread).
+_mesh_send_lock = threading.Lock()
+
+
 def send_dm_to_pocket(text: str, on_ack=None) -> None:
     """Send a DM to the pocket node. If `on_ack` is given, it will be called
     once when the routing-ACK / NAK arrives (or library timeout fires).
     The callback runs on the meshtastic background thread — keep it light
     (push to _mesh_queue, do real work in the asyncio dispatcher).
+
+    Synchronous: USB-write блокирует поток на 50–200 мс. Из async-кода
+    использовать `send_dm_to_pocket_async` — там это вынесено в thread-pool.
     """
     if _mesh_iface is None:
         raise RuntimeError("Mesh interface not connected")
-    _mesh_iface.sendText(
-        text,
-        destinationId=POCKET_NODE_ID,
-        wantAck=True,
-        onResponse=on_ack,
-    )
+    with _mesh_send_lock:
+        _mesh_iface.sendText(
+            text,
+            destinationId=POCKET_NODE_ID,
+            wantAck=True,
+            onResponse=on_ack,
+            hopLimit=MESH_HOP_LIMIT,
+        )
+
+
+async def send_dm_to_pocket_async(text: str, on_ack=None) -> None:
+    """Async-friendly обёртка над send_dm_to_pocket. USB-write уносится в
+    thread-pool, asyncio event loop не блокируется на время передачи.
+    Сериализация конкурентных вызовов гарантируется внутренним
+    `_mesh_send_lock` (один пакет в моменте — как и физическое радио)."""
+    await asyncio.to_thread(send_dm_to_pocket, text, on_ack)
 
 
 def list_nodes_except_self() -> list[dict]:
@@ -1001,7 +1074,7 @@ def _reply_favlist_payload() -> str:
 async def _handle_sos(app: Application, sos_text: str) -> None:
     """#SOS triggered from pocket: fan-out to recipients with optional GPS."""
     if not SOS_ENABLED:
-        send_dm_to_pocket("SOS off (включи в настройках)")
+        await send_dm_to_pocket_async("SOS off (включи в настройках)")
         await _notify_owner(
             app,
             f"⚠️ #SOS получен, но SOS_ENABLED=False. Сообщение: «{sos_text}»",
@@ -1009,7 +1082,7 @@ async def _handle_sos(app: Application, sos_text: str) -> None:
         return
 
     if not SOS_RECIPIENTS:
-        send_dm_to_pocket("SOS: список пуст")
+        await send_dm_to_pocket_async("SOS: список пуст")
         await _notify_owner(
             app,
             "⚠️ #SOS получен, но recipients пуст. Заполни через настройки.",
@@ -1052,7 +1125,7 @@ async def _handle_sos(app: Application, sos_text: str) -> None:
             log.exception("SOS to %s failed", tg_id)
 
     log.warning("SOS triggered. delivered=%d/%d", delivered, len(SOS_RECIPIENTS))
-    send_dm_to_pocket(f"SOS отправлен {delivered}/{len(SOS_RECIPIENTS)}")
+    await send_dm_to_pocket_async(f"SOS отправлен {delivered}/{len(SOS_RECIPIENTS)}")
     await _notify_owner(
         app,
         f"🆘 SOS triggered.\nДоставлено: {delivered}/{len(SOS_RECIPIENTS)}.\n"
@@ -1094,20 +1167,20 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
     if kind == "standalone_cmd":
         cmd = parsed["cmd"]
         if cmd == "status":
-            send_dm_to_pocket(_reply_status_payload())
+            await send_dm_to_pocket_async(_reply_status_payload())
         elif cmd == "help":
             help_msg = "@N текст=ответ. @N !ban=бан. !status. !help."
             if GPS_ENABLED:
                 help_msg += " GPS(beta): @N !fav/!unfav, !gps, !favlist."
             if SOS_ENABLED:
                 help_msg += " #SOS текст = тревога."
-            send_dm_to_pocket(help_msg)
+            await send_dm_to_pocket_async(help_msg)
         elif cmd == "gps":
-            send_dm_to_pocket(_reply_gps_payload())
+            await send_dm_to_pocket_async(_reply_gps_payload())
         elif cmd == "favlist":
-            send_dm_to_pocket(_reply_favlist_payload())
+            await send_dm_to_pocket_async(_reply_favlist_payload())
         else:
-            send_dm_to_pocket(f"!{cmd}? есть: !status, !help")
+            await send_dm_to_pocket_async(f"!{cmd}? есть: !status, !help")
         await _notify_owner(app, f"🎒 Команда с кармана: !{cmd}")
         return
 
@@ -1116,22 +1189,22 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
         cmd = parsed["cmd"]
         tg_uid = slot_lookup(n)
         if tg_uid is None:
-            send_dm_to_pocket(f"@{n} не активен")
+            await send_dm_to_pocket_async(f"@{n} не активен")
             await _notify_owner(app, f"⚠️ С кармана: @{n} !{cmd} — слот не активен.")
             return
         if cmd == "ban":
             user_set_banned(tg_uid, True)
             slot_free_all_for_user(tg_uid)
             dname = user_display(tg_uid)
-            send_dm_to_pocket(f"@{n} {dname[:10]} забанен")
+            await send_dm_to_pocket_async(f"@{n} {dname[:10]} забанен")
             await _notify_owner(app, f"🚫 Забанен {dname} (tg {tg_uid}) через @{n}.")
         elif cmd == "fav":
             if not GPS_ENABLED:
-                send_dm_to_pocket(f"@{n} GPS off")
+                await send_dm_to_pocket_async(f"@{n} GPS off")
                 return
             added = fav_add(tg_uid, note=f"via @{n}")
             dname = user_display(tg_uid)
-            send_dm_to_pocket(
+            await send_dm_to_pocket_async(
                 f"@{n} {dname[:10]} {'+fav' if added else 'уже fav'}"
             )
             await _notify_owner(
@@ -1141,11 +1214,11 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
             )
         elif cmd == "unfav":
             if not GPS_ENABLED:
-                send_dm_to_pocket(f"@{n} GPS off")
+                await send_dm_to_pocket_async(f"@{n} GPS off")
                 return
             removed = fav_remove(tg_uid)
             dname = user_display(tg_uid)
-            send_dm_to_pocket(
+            await send_dm_to_pocket_async(
                 f"@{n} {dname[:10]} {'-fav' if removed else 'не fav'}"
             )
             await _notify_owner(
@@ -1157,14 +1230,14 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
             avail = "!ban"
             if GPS_ENABLED:
                 avail += ", !fav, !unfav"
-            send_dm_to_pocket(f"@{n} !{cmd}? есть: {avail}")
+            await send_dm_to_pocket_async(f"@{n} !{cmd}? есть: {avail}")
         return
 
     if kind == "slot_reply":
         n = parsed["n"]
         reply_text = parsed["text"]
         if not reply_text:
-            send_dm_to_pocket(f"@{n} пустой ответ")
+            await send_dm_to_pocket_async(f"@{n} пустой ответ")
             return
         tg_uid = slot_lookup(n)
         if tg_uid is None:
@@ -1172,7 +1245,7 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
                 app,
                 f"⚠️ Ответ на @{n}, но слот не активен.\nТекст: {reply_text}",
             )
-            send_dm_to_pocket(f"@{n} уже неактуален")
+            await send_dm_to_pocket_async(f"@{n} уже неактуален")
             return
         ok = await _dm_user_reply(app, tg_uid, reply_text)
         if ok:
@@ -1183,7 +1256,7 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
             retry_delete_for_slot(n)
             await _notify_owner(app, f"✅ @{n} → {user_display(tg_uid)}: {reply_text}")
         else:
-            send_dm_to_pocket(f"@{n} не доставлено")
+            await send_dm_to_pocket_async(f"@{n} не доставлено")
         return
 
     # kind == "raw"
@@ -1264,7 +1337,7 @@ async def retry_worker(app: Application) -> None:
                         log.exception("retry-ack cb failed")
 
                 try:
-                    send_dm_to_pocket(row["payload"], on_ack=_on_ack)
+                    await send_dm_to_pocket_async(row["payload"], on_ack=_on_ack)
                 except Exception:
                     log.info("retry_id=%s still failing (attempt %d)",
                              row["id"], row["attempts"] + 1)
@@ -1327,7 +1400,7 @@ async def cmd_retry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             log.exception("manual-retry ack cb failed")
 
     try:
-        send_dm_to_pocket(row["payload"], on_ack=_on_ack)
+        await send_dm_to_pocket_async(row["payload"], on_ack=_on_ack)
     except Exception:
         log.exception("manual retry failed for retry_id=%s", retry_id)
         try:
@@ -1892,7 +1965,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             )
             return
         try:
-            send_dm_to_pocket(payload)
+            await send_dm_to_pocket_async(payload)
             await update.message.reply_text(f"🧪 → карман:\n{payload}")
         except Exception as e:
             log.exception("admin echo send failed")
@@ -1936,12 +2009,19 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     tag = user_get_entry_tag(u.id)
     payload = _format_lora_packet(n, u, text, entry_tag=tag)
 
-    # Status message: "📨 Передаю..." → edit on outcome (TASK-2).
-    # IMPORTANT: do NOT attach ReplyKeyboardMarkup here — Telegram refuses to
-    # edit messages with reply_markup attached at send-time. The keyboard is
-    # already shown by /start (ReplyKeyboard is sticky on the chat).
-    status_msg = await update.message.reply_text(
-        f"📨 Передаю сообщение для {DISPLAY_NAME}…"
+    # Параллельно: TG-статус (HTTP к Telegram, ~500–1000 мс) и LoRa-передача
+    # (USB+эфир, обычно сравнимо). Раньше это шло последовательно, экономим
+    # 0.3–1 с на каждое сообщение. ACK callback ниже захватывает chat_id из
+    # closure (а не из status_msg), поэтому даже если status_msg-задача
+    # упадёт, "✓ Доставлено" всё равно прилетит юзеру. Race-condition нет.
+    #
+    # IMPORTANT: НЕ прикреплять ReplyKeyboardMarkup к status_msg —
+    # Telegram отказывается edit'ить такие сообщения. Клавиатура уже стикки
+    # с /start.
+    status_task = asyncio.create_task(
+        update.message.reply_text(
+            f"📨 Передаю сообщение для {DISPLAY_NAME}…"
+        )
     )
 
     # ACK / delivery-receipt callback — fires from the meshtastic bg thread
@@ -1963,24 +2043,47 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         except Exception:
             log.exception("ack callback failed")
 
+    send_failed: Optional[Exception] = None
     try:
-        send_dm_to_pocket(payload, on_ack=_on_ack)
+        await send_dm_to_pocket_async(payload, on_ack=_on_ack)
+    except Exception as exc:
+        send_failed = exc
+        log.exception("Initial send to pocket failed")
+
+    # Дожидаемся placeholder для последующих edit'ов. Если он упал
+    # (TG NetworkError) — деградируем чисто: без placeholder'а, но
+    # ack-flow по-прежнему отработает.
+    try:
+        status_msg = await status_task
     except Exception:
-        log.exception("Initial send to pocket failed; enqueueing retry")
-        now = _now()
-        deadline = now + (SLOT_STICKY_HOURS if reused else SLOT_TTL_HOURS) * 3600
-        retry_id = retry_enqueue(
-            u.id, update.effective_chat.id, status_msg.message_id,
-            n, payload, deadline, RETRY_INITIAL_DELAY_MIN * 60,
-        )
-        queue_text = (
-            f"⏳ {DISPLAY_NAME} пока вне связи. Сообщение в очереди — "
-            "попробую автоматически в ближайшие минуты."
-        )
-        await _show_status(
-            update, status_msg, queue_text,
-            reply_markup=_retry_inline_markup(retry_id),
-        )
+        log.exception("status reply_text failed; continuing without placeholder")
+        status_msg = None
+
+    if send_failed is not None:
+        if status_msg is not None:
+            now = _now()
+            deadline = now + (SLOT_STICKY_HOURS if reused else SLOT_TTL_HOURS) * 3600
+            retry_id = retry_enqueue(
+                u.id, update.effective_chat.id, status_msg.message_id,
+                n, payload, deadline, RETRY_INITIAL_DELAY_MIN * 60,
+            )
+            queue_text = (
+                f"⏳ {DISPLAY_NAME} пока вне связи. Сообщение в очереди — "
+                "попробую автоматически в ближайшие минуты."
+            )
+            await _show_status(
+                update, status_msg, queue_text,
+                reply_markup=_retry_inline_markup(retry_id),
+            )
+        else:
+            # Редкий double-fail: TG reply_text упал И mesh send упал.
+            # status_msg нет → retry_queue не используем (для retry нужен
+            # message_id для будущих edit'ов). Залогируем и пропустим —
+            # прошивка сама ретранслирует sendText до 3 раз через wantAck.
+            log.warning(
+                "Double failure: TG reply_text + mesh send. User=%s, slot=@%s",
+                u.id, n,
+            )
         return
 
     # Success branch — fresh vs stale hint for the user.
@@ -1988,7 +2091,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     success_text = "📨 Сообщение отправлено. Ответ обычно в течение 2–5 минут."
     if hint:
         success_text += "\n" + hint.strip()
-    await _show_status(update, status_msg, success_text)
+    if status_msg is not None:
+        await _show_status(update, status_msg, success_text)
 
 
 async def _reject_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2016,42 +2120,9 @@ async def on_post_init(app: Application) -> None:
     )
 
 
-def main() -> None:
-    global _mesh_iface, MESHTASTIC_PORT
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--port",
-        default=None,
-        help="Serial port, e.g. COM3. Overrides MESHTASTIC_PORT in config.",
-    )
-    args = parser.parse_args()
-    if args.port:
-        MESHTASTIC_PORT = args.port
-
-    if not BOT_TOKEN or BOT_TOKEN.startswith("PASTE_"):
-        raise SystemExit(
-            "Set BOT_TOKEN in relay.py. Create a NEW bot via @BotFather for the "
-            "public relay (do not reuse the personal bot.py token)."
-        )
-
-    db_init()
-    _mesh_iface = _connect_mesh()
-
-    if _my_node_id == POCKET_NODE_ID:
-        log.warning(
-            "HOME (%s) == POCKET (%s). This machine is plugged into the pocket "
-            "node itself; DMs will loop to ourselves. Check POCKET_NODE_ID.",
-            _my_node_id, POCKET_NODE_ID,
-        )
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .post_init(on_post_init)
-        .build()
-    )
-
+def _register_handlers(app: Application) -> None:
+    """Все handler'ы бота. Вынесено для повторного использования при
+    перезапуске polling после NetworkError."""
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("nodes", cmd_nodes))
@@ -2090,8 +2161,111 @@ def main() -> None:
     ):
         app.add_handler(MessageHandler(f, _reject_media))
 
-    log.info("Starting Telegram polling...")
-    app.run_polling()
+
+def _build_app() -> Application:
+    """Каждый перезапуск polling требует свежий Application — старый закрыт
+    своим event-loop'ом после исключения. Mesh-иntфейс и БД глобальны и
+    переживают перезапуск без изменений."""
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(on_post_init)
+        .build()
+    )
+    _register_handlers(app)
+    return app
+
+
+def _run_polling_with_retry() -> None:
+    """Бесконечный цикл: запускаем polling, ловим сетевые/конфликтные ошибки
+    Telegram и перезапускаемся с экспоненциальным backoff. Ctrl+C / SIGTERM
+    выходят чисто; нормальный return из run_polling (граceful shutdown)
+    тоже останавливает цикл."""
+    delay = POLLING_RESTART_INITIAL_SEC
+    while True:
+        run_started_at = time.time()
+        try:
+            app = _build_app()
+            log.info("Starting Telegram polling...")
+            # poll_interval=0.3 — пауза между long-poll'ами, чем меньше тем
+            # быстрее реакция на входящие. timeout=30 — keep-alive long-poll.
+            # Стандартные production-значения PTB.
+            app.run_polling(poll_interval=0.3, timeout=30)
+            # Граceful shutdown (Application.stop() / SIGTERM из PTB) —
+            # не ошибка, выходим из цикла.
+            log.info("Polling exited cleanly. Main loop stopping.")
+            return
+        except KeyboardInterrupt:
+            log.info("Ctrl+C — shutting down.")
+            return
+        except RetryAfter as e:
+            # Telegram прямо говорит «подожди столько-то». Уважаем и
+            # сбрасываем backoff к initial.
+            wait = int(getattr(e, "retry_after", 30)) + 1
+            log.warning("Telegram RetryAfter: wait %ds.", wait)
+            time.sleep(wait)
+            delay = POLLING_RESTART_INITIAL_SEC
+            continue
+        except (NetworkError, TimedOut) as e:
+            log.warning(
+                "Telegram network problem: %s — restart in %ds.",
+                e, delay,
+            )
+        except Conflict as e:
+            # Другая копия бота с тем же токеном съела getUpdates.
+            # Восстанавливать смысла нет, но всё равно ретраим — может,
+            # тот процесс умрёт. Ставим бэк-офф побольше.
+            log.error(
+                "Telegram Conflict (другой процесс с тем же токеном?): %s "
+                "— restart in %ds.", e, delay,
+            )
+        except Exception:
+            log.exception(
+                "Unexpected error in run_polling — restart in %ds.", delay,
+            )
+
+        # Если polling успел проработать стабильно — сбрасываем backoff.
+        # Это лечит ситуацию «раз в день моргнул интернет на 1 секунду» —
+        # не нужно выходить на 5-минутную паузу.
+        uptime = time.time() - run_started_at
+        if uptime >= POLLING_STABLE_RESET_SEC:
+            delay = POLLING_RESTART_INITIAL_SEC
+
+        log.info("Restart in %d sec...", delay)
+        time.sleep(delay)
+        delay = min(delay * 2, POLLING_RESTART_MAX_SEC)
+
+
+def main() -> None:
+    global _mesh_iface, MESHTASTIC_PORT
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--port",
+        default=None,
+        help="Serial port, e.g. COM3. Overrides MESHTASTIC_PORT in config.",
+    )
+    args = parser.parse_args()
+    if args.port:
+        MESHTASTIC_PORT = args.port
+
+    if not BOT_TOKEN or BOT_TOKEN.startswith("PASTE_"):
+        raise SystemExit(
+            "Set BOT_TOKEN in relay.py. Create a NEW bot via @BotFather for the "
+            "public relay (do not reuse the personal bot.py token)."
+        )
+
+    db_init()
+    _mesh_iface = _connect_mesh()
+
+    if _my_node_id == POCKET_NODE_ID:
+        log.warning(
+            "HOME (%s) == POCKET (%s). This machine is plugged into the pocket "
+            "node itself; DMs will loop to ourselves. Check POCKET_NODE_ID.",
+            _my_node_id, POCKET_NODE_ID,
+        )
+
+    _run_polling_with_retry()
 
 
 if __name__ == "__main__":

@@ -4,6 +4,8 @@ relay/relay.db
 relay/relay.db-journal
 relay/relay.db-wal
 relay/relay.db-shm
+relay/relay.log
+relay/relay.log.*
 
 # Python
 __pycache__/
