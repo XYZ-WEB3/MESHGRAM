@@ -22,11 +22,12 @@ import serial.tools.list_ports
 from PyQt6.QtCore import (
     QProcess,
     QProcessEnvironment,
+    QSharedMemory,
     QSize,
     Qt,
     QTimer,
 )
-from PyQt6.QtGui import QAction, QColor, QFont, QKeySequence, QShortcut
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -44,6 +45,8 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QStyle,
+    QSystemTrayIcon,
     QToolBar,
     QVBoxLayout,
     QWidget,
@@ -79,6 +82,13 @@ class Relay(QMainWindow):
         self.setMinimumSize(1100, 700)
         self.process: Optional[QProcess] = None
         self._cfg = settings_mod.load()
+        self._quit_requested = False   # True если выход через tray-menu / Cmd+Q
+
+        # App-level icon (для taskbar / tray). Берём mark.svg из бренд-папки;
+        # если её нет (например в распакованном .exe — bundle-папка другая),
+        # fallback на стандартную иконку Qt.
+        app_icon = self._load_app_icon()
+        self.setWindowIcon(app_icon)
 
         self._build_menu()
         self._build_central()
@@ -89,6 +99,10 @@ class Relay(QMainWindow):
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh_status)
         self._timer.start(self.POLL_MS)
+
+        # System tray
+        self._tray: Optional[QSystemTrayIcon] = None
+        self._setup_tray(app_icon)
 
         # Hot keys
         QShortcut(QKeySequence("F5"), self, activated=self._start)
@@ -101,6 +115,78 @@ class Relay(QMainWindow):
         # First run
         if not settings_mod.exists():
             QTimer.singleShot(200, self._first_run)
+
+    # =====================================================================
+    # Icon + system tray
+    @staticmethod
+    def _load_app_icon() -> QIcon:
+        """Загрузить иконку приложения. Ищет в нескольких местах:
+        1. bundle-data при PyInstaller-сборке (sys._MEIPASS/assets/icon.png)
+        2. рядом со скриптом: relay/assets/icon.png
+        3. фолбэк на стандартную системную иконку
+        """
+        candidates = []
+        # PyInstaller onefile / onedir
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(Path(meipass) / "assets" / "icon.png")
+            candidates.append(Path(meipass) / "assets" / "icon.svg")
+        # Standalone — рядом со скриптом
+        candidates.append(SCRIPT_DIR / "assets" / "icon.png")
+        candidates.append(SCRIPT_DIR / "assets" / "icon.svg")
+        # Source layout — site/assets/logo/mark.svg
+        candidates.append(SCRIPT_DIR.parent / "site" / "assets" / "logo" / "mark.svg")
+
+        for path in candidates:
+            if path.exists():
+                icon = QIcon(str(path))
+                if not icon.isNull():
+                    return icon
+        # Фолбэк на стандартную Qt-иконку
+        app = QApplication.instance()
+        if app is not None:
+            return app.style().standardIcon(QStyle.StandardPixmap.SP_ComputerIcon)
+        return QIcon()
+
+    def _setup_tray(self, icon: QIcon) -> None:
+        """Создаёт QSystemTrayIcon с меню Show/Hide/Quit. Если трей в системе
+        недоступен (редко на современных DE) — просто пропускаем."""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        self._tray = QSystemTrayIcon(icon, self)
+        self._tray.setToolTip("Meshgram Relay")
+
+        menu = QMenu(self)
+        act_show = QAction("Открыть", self, triggered=self._tray_show)
+        act_start = QAction("Старт релея", self, triggered=self._start)
+        act_stop = QAction("Стоп релея", self, triggered=self._stop)
+        act_quit = QAction("Выйти", self, triggered=self._tray_quit)
+        menu.addAction(act_show)
+        menu.addSeparator()
+        menu.addAction(act_start)
+        menu.addAction(act_stop)
+        menu.addSeparator()
+        menu.addAction(act_quit)
+        self._tray.setContextMenu(menu)
+
+        # Двойной клик / Click по иконке → показать
+        self._tray.activated.connect(self._on_tray_activated)
+        self._tray.show()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.ActivationReason.Trigger,
+                      QSystemTrayIcon.ActivationReason.DoubleClick):
+            self._tray_show()
+
+    def _tray_show(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_quit(self) -> None:
+        """Полное закрытие приложения из tray-меню (минуя «свернуть в трей»)."""
+        self._quit_requested = True
+        self.close()
 
     # =====================================================================
     # Menu
@@ -667,6 +753,26 @@ class Relay(QMainWindow):
         self._refresh_status()
 
     def closeEvent(self, ev) -> None:
+        # Если трей доступен и юзер закрывает крестиком — сворачиваем в трей
+        # (релей продолжает работать). Полный выход — через tray-меню «Выйти».
+        if (
+            self._tray is not None
+            and self._tray.isVisible()
+            and not self._quit_requested
+        ):
+            ev.ignore()
+            self.hide()
+            # Один раз показываем уведомление что не закрылись, а свернулись.
+            if not getattr(self, "_tray_notified", False):
+                self._tray.showMessage(
+                    "Meshgram свёрнут",
+                    "Релей продолжает работать в фоне. Полное закрытие — через меню в трее.",
+                    QSystemTrayIcon.MessageIcon.Information,
+                    4000,
+                )
+                self._tray_notified = True
+            return
+
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             r = QMessageBox.question(
                 self, "Релей работает",
@@ -674,17 +780,52 @@ class Relay(QMainWindow):
             )
             if r != QMessageBox.StandardButton.Yes:
                 ev.ignore()
+                self._quit_requested = False  # отмена
                 return
             self.process.kill()
             self.process.waitForFinished(3000)
+        # Скрываем трей перед закрытием — иначе он зависнет в systray
+        if self._tray is not None:
+            self._tray.hide()
         ev.accept()
+
+
+# Уникальный ключ shared-memory для single-instance проверки. Если
+# второй экземпляр пытается стартовать — он увидит что ключ занят и
+# покажет окно уже работающего (через активацию tray, либо просто
+# покажет MessageBox и выйдет).
+_SINGLE_INSTANCE_KEY = "Meshgram-Relay-SingleInstance-v1"
 
 
 def main() -> None:
     app = QApplication(sys.argv)
+    app.setApplicationName("Meshgram")
+    app.setApplicationDisplayName("Meshgram Relay")
+    # Tray-режим: GUI можно скрыть в трей, app не должен умирать
+    # когда последнее окно закрыто.
+    app.setQuitOnLastWindowClosed(False)
+
+    # Single-instance: пытаемся захватить shared memory. Если уже занято —
+    # это второй запуск, показываем сообщение и выходим.
+    shared = QSharedMemory(_SINGLE_INSTANCE_KEY)
+    # На POSIX могут оставаться битые segments после краха — ловим и чистим.
+    if shared.attach():
+        shared.detach()
+    if not shared.create(1):
+        QMessageBox.information(
+            None, "Meshgram уже запущен",
+            "Meshgram Relay уже работает (см. иконку в системном трее).\n"
+            "Если это ошибка — закрой все процессы python.exe в диспетчере "
+            "задач и запусти заново.",
+        )
+        sys.exit(0)
+
     apply_theme(app)
     w = Relay()
     w.show()
+
+    # Держим shared memory live до выхода
+    app._meshgram_shared_memory = shared    # type: ignore[attr-defined]
     sys.exit(app.exec())
 
 

@@ -4,6 +4,62 @@
 
 ---
 
+## v0.7.1 — тесты, упакованный .exe, tray и single-instance
+
+### Тесты (pytest)
+
+`relay/tests/` — 67 unit-тестов покрывают: парсер mesh-сообщений (все 7 веток включая новые `@ai`/`@aiN`), `_chunk_text` и `_format_lora_packet`, `_is_urgent` для SOS fast-retry, sticky-логику слотов, retry-queue (включая `is_sos` флаг), AI-БД хелперы.
+
+Запуск:
+
+```bash
+cd <repo>
+python -m pytest relay/tests/ -v
+```
+
+Все 67 проходят. Используется in-memory SQLite через фикстуру `relay_with_db` в `conftest.py` — реального оборудования и сети не требуется.
+
+В процессе написания тестов **обнаружен и исправлен реальный баг**: `ai_get_history` сортировала по `ts DESC LIMIT N` без тай-брейка, и при нескольких сообщениях в одну секунду (типичный случай — user сразу получил assistant-ответ) порядок становился неопределённым. На прод это бы означало, что LLM получал перемешанные роли в history и качество ответов падало. Фикс: `ORDER BY ts DESC, id DESC` (`id` autoincrement гарантирует порядок).
+
+### Упакованный `Meshgram.exe` для Windows
+
+Один файл, ~74 МБ, без необходимости ставить Python. Двойной клик → запускается GUI. Внутри:
+
+- `gui.py` как entry-point, релей стартует через `QProcess` из GUI
+- Все ассеты (50 SVG моделей нод, иконка) bundle'нуты внутрь
+- Иконка приложения `relay/assets/icon.ico` (multi-size 16/24/32/48/64/128/256)
+- `console=False` — чёрный терминал не мелькает при старте
+- PyInstaller spec — `relay/Meshgram.spec`
+
+Сборка локально:
+
+```bash
+cd relay
+pip install pyinstaller
+pyinstaller Meshgram.spec --clean
+# готовый файл: relay/dist/Meshgram.exe
+```
+
+Готовый бинарник также доступен в [GitHub Releases](https://github.com/XYZ-WEB3/MESHGRAM/releases).
+
+### System tray
+
+GUI теперь умеет жить в системном трее:
+
+- Иконка в трее показывается всегда пока приложение запущено
+- Закрытие крестиком → сворачивает в трей (релей продолжает работать в фоне)
+- Tray-меню: «Открыть» / «Старт релея» / «Стоп релея» / «Выйти»
+- При первом сворачивании — уведомление «Meshgram свёрнут, релей продолжает работать в фоне»
+- Полное закрытие — только через «Выйти» из tray-меню
+
+Реализовано через `QSystemTrayIcon` + `QApplication.setQuitOnLastWindowClosed(False)`.
+
+### Single-instance
+
+`QSharedMemory` с уникальным ключом `Meshgram-Relay-SingleInstance-v1` — попытка запустить вторую копию показывает MessageBox «Meshgram уже запущен» и выходит. Это спасает от двух конкурирующих процессов, борющихся за один COM-порт ноды (что приводило к `Conflict: getUpdates already in progress` от Telegram и `serial.serialutil.SerialException` от ноды).
+
+---
+
 ## v0.7 — AI-помощник через локальную LLM
 
 С карманной ноды `@ai <вопрос>` — локальная модель (LM Studio / Ollama / любой OpenAI-совместимый endpoint) отвечает. Продолжение диалога — `@aiN <вопрос>`, история подтягивается в контекст модели. По умолчанию выключен; включается `AI_ENABLED=true` в `.env`.

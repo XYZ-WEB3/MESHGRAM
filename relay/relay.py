@@ -751,11 +751,14 @@ def ai_save_message(slot_n_ai: int, role: str, content: str) -> None:
 def ai_get_history(slot_n_ai: int, max_messages: int) -> list[dict]:
     """Вернуть последние N сообщений в OpenAI-формате (без system).
     Сортировка по ts asc — старые сначала, чтобы LLM видел хронологию.
+    Тай-брейк по id (autoincrement) — критично, потому что несколько
+    save_message в одну секунду имеют одинаковый ts, и без id порядок
+    неопределён → LLM получает перемешанные роли.
     """
     with _db_lock:
         cur = _db.execute(
             "SELECT role, content FROM ai_messages "
-            "WHERE slot_n_ai = ? ORDER BY ts DESC LIMIT ?",
+            "WHERE slot_n_ai = ? ORDER BY ts DESC, id DESC LIMIT ?",
             (slot_n_ai, max_messages),
         )
         rows = cur.fetchall()
