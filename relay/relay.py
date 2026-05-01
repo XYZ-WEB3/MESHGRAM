@@ -82,6 +82,7 @@ POLLING_STABLE_RESET_SEC:    int = 60
 # ============================================================
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
+import ai_helper
 import settings as _settings_mod
 
 _S = _settings_mod.load()
@@ -123,6 +124,25 @@ RETRY_MAX_INTERVAL_MIN: int  = int(_S["retry_max_interval_min"])
 # окна ретрансляции. Поднять в .env (MESH_HOP_LIMIT=3) если pocket-нода
 # может оказаться за пределами прямой видимости.
 MESH_HOP_LIMIT: int = int(_S["mesh_hop_limit"])
+
+# Режим доставки. "reliable" — wantAck=True, ретраи, статусы доставки.
+# "fast" — wantAck=False, fire-and-forget: мгновенно, без подтверждения.
+MESH_DELIVERY_MODE: str = str(_S.get("mesh_delivery_mode") or "reliable").lower()
+if MESH_DELIVERY_MODE not in ("reliable", "fast"):
+    MESH_DELIVERY_MODE = "reliable"
+MESH_WANT_ACK: bool = (MESH_DELIVERY_MODE == "reliable")
+
+# AI helper. Активируется через AI_ENABLED=true и работает с любым
+# OpenAI-совместимым endpoint'ом (LM Studio, Ollama, vLLM, OpenAI cloud).
+AI_ENABLED: bool         = bool(_S.get("ai_enabled", False))
+AI_BASE_URL: str         = str(_S.get("ai_base_url") or "http://localhost:1234/v1")
+AI_API_KEY: str          = str(_S.get("ai_api_key") or "lm-studio")
+AI_MODEL: str            = str(_S.get("ai_model") or "llama-3.2-8b-instruct")
+AI_SYSTEM_PROMPT: str    = str(_S.get("ai_system_prompt") or
+                               "Отвечай коротко и ясно. Максимум 2-3 предложения.")
+AI_TIMEOUT_SEC: int      = int(_S.get("ai_timeout_sec") or 30)
+AI_MAX_HISTORY: int      = int(_S.get("ai_max_history") or 10)
+AI_TTL_HOURS: int        = int(_S.get("ai_ttl_hours") or 168)
 
 # SQLite file next to this script.
 DB_PATH: Path = Path(__file__).with_name("relay.db")
@@ -248,6 +268,8 @@ CREATE TABLE IF NOT EXISTS gps_position (
 );
 
 -- Delivery retry queue (TASK-2).
+-- is_sos=1 → fast-retry (5/15/30/60/120 сек) для срочных сообщений
+-- (юзер написал «#SOS» / «срочно» / «urgent» в тексте).
 CREATE TABLE IF NOT EXISTS retry_queue (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     tg_user_id     INTEGER NOT NULL,
@@ -257,12 +279,44 @@ CREATE TABLE IF NOT EXISTS retry_queue (
     payload        TEXT NOT NULL,
     attempts       INTEGER NOT NULL DEFAULT 0,
     next_try_at    INTEGER NOT NULL,
-    deadline       INTEGER NOT NULL
+    deadline       INTEGER NOT NULL,
+    is_sos         INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_retry_next ON retry_queue(next_try_at);
 CREATE INDEX IF NOT EXISTS idx_retry_slot ON retry_queue(slot_n);
+
+-- AI helper: чаты с локальной/облачной LLM, инициируются с pocket
+-- командой «@ai <вопрос>», продолжаются как «@aiN <вопрос>».
+CREATE TABLE IF NOT EXISTS ai_conversations (
+    slot_n_ai     INTEGER PRIMARY KEY,
+    created_at    INTEGER NOT NULL,
+    last_used_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS ai_messages (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    slot_n_ai     INTEGER NOT NULL,
+    role          TEXT NOT NULL,    -- 'user' / 'assistant' (system промпт идёт из настроек, не хранится)
+    content       TEXT NOT NULL,
+    ts            INTEGER NOT NULL,
+    FOREIGN KEY (slot_n_ai) REFERENCES ai_conversations(slot_n_ai) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_aimsg_slot ON ai_messages(slot_n_ai);
+CREATE INDEX IF NOT EXISTS idx_aimsg_ts   ON ai_messages(ts);
 """
+
+
+# SOS fast-retry — для срочных сообщений (#SOS / срочно / urgent в тексте).
+# Шаги: 5 → 15 → 30 → 60 → 120 секунд (вместо стандартных 2-15 минут).
+_RETRY_SOS_BACKOFF_SEC = (5, 15, 30, 60, 120)
+_RE_URGENT = re.compile(r"#SOS\b|\b(?:срочно|urgent|emergency)\b", re.IGNORECASE)
+
+
+def _is_urgent(text: str) -> bool:
+    """True если текст содержит SOS-маркер. Триггерит fast-retry."""
+    return bool(_RE_URGENT.search(text or ""))
 
 
 def _now() -> int:
@@ -274,6 +328,12 @@ def db_init() -> None:
     _db = sqlite3.connect(DB_PATH, check_same_thread=False)
     _db.row_factory = sqlite3.Row
     with _db_lock:
+        # WAL: одновременные read'ы не блокируют пишущего, и наоборот.
+        # Под нашу нагрузку (один Михаил, retry_worker, expiry_worker, GUI
+        # пишет users/banlist) — снимает риск "database is locked".
+        # synchronous=NORMAL — стандартный безопасный компромисс для WAL.
+        _db.execute("PRAGMA journal_mode=WAL;")
+        _db.execute("PRAGMA synchronous=NORMAL;")
         _db.executescript(_DB_SCHEMA)
         _migrate_if_needed()
         _db.commit()
@@ -296,6 +356,12 @@ def _migrate_if_needed() -> None:
         _db.execute("ALTER TABLE slots ADD COLUMN was_replied INTEGER NOT NULL DEFAULT 0")
     if "last_message" not in cols:
         _db.execute("ALTER TABLE slots ADD COLUMN last_message TEXT")
+
+    # retry_queue.is_sos — SOS fast-retry для срочных сообщений
+    cur = _db.execute("PRAGMA table_info(retry_queue)")
+    cols = {row["name"] for row in cur.fetchall()}
+    if "is_sos" not in cols:
+        _db.execute("ALTER TABLE retry_queue ADD COLUMN is_sos INTEGER NOT NULL DEFAULT 0")
 
 
 # ---------- users ----------
@@ -571,15 +637,21 @@ def cat_by_tag(tag: str) -> Optional[dict]:
 # ---------- retry_queue (TASK-2: delivery retries) ----------
 def retry_enqueue(tg_user_id: int, tg_chat_id: int, status_msg_id: int,
                   slot_n: int, payload: str, deadline: int,
-                  initial_delay_s: int) -> int:
+                  initial_delay_s: int, *, is_sos: bool = False) -> int:
+    """Положить сообщение в retry-очередь.
+
+    `is_sos=True` → fast-retry с шагами 5/15/30/60/120 секунд (вместо
+    стандартных 2-15 минут). Используется для срочных сообщений
+    (текст содержит «#SOS», «срочно», «urgent» и т.п.).
+    """
     with _db_lock:
         cur = _db.execute(
             "INSERT INTO retry_queue "
             "(tg_user_id, tg_chat_id, status_msg_id, slot_n, payload, "
-            " attempts, next_try_at, deadline) "
-            "VALUES (?, ?, ?, ?, ?, 0, ?, ?)",
+            " attempts, next_try_at, deadline, is_sos) "
+            "VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?)",
             (tg_user_id, tg_chat_id, status_msg_id, slot_n, payload,
-             _now() + initial_delay_s, deadline),
+             _now() + initial_delay_s, deadline, 1 if is_sos else 0),
         )
         _db.commit()
         return int(cur.lastrowid)
@@ -632,6 +704,95 @@ def retry_delete_for_slot(slot_n: int) -> None:
     with _db_lock:
         _db.execute("DELETE FROM retry_queue WHERE slot_n = ?", (slot_n,))
         _db.commit()
+
+
+# ---------- AI conversations (TASK: AI helper) ----------
+def ai_alloc_slot() -> int:
+    """Выделить новый @aiN — наименьший свободный integer >= 1."""
+    n = _now()
+    with _db_lock:
+        cur = _db.execute("SELECT slot_n_ai FROM ai_conversations ORDER BY slot_n_ai")
+        taken = {r["slot_n_ai"] for r in cur.fetchall()}
+        slot = 1
+        while slot in taken:
+            slot += 1
+        _db.execute(
+            "INSERT INTO ai_conversations (slot_n_ai, created_at, last_used_at) "
+            "VALUES (?, ?, ?)",
+            (slot, n, n),
+        )
+        _db.commit()
+    return slot
+
+
+def ai_touch_slot(slot_n_ai: int) -> bool:
+    """Обновить last_used_at. Returns True если slot существует."""
+    n = _now()
+    with _db_lock:
+        cur = _db.execute(
+            "UPDATE ai_conversations SET last_used_at = ? WHERE slot_n_ai = ?",
+            (n, slot_n_ai),
+        )
+        _db.commit()
+        return cur.rowcount > 0
+
+
+def ai_save_message(slot_n_ai: int, role: str, content: str) -> None:
+    """Записать одно сообщение в историю чата. role: 'user' | 'assistant'."""
+    with _db_lock:
+        _db.execute(
+            "INSERT INTO ai_messages (slot_n_ai, role, content, ts) "
+            "VALUES (?, ?, ?, ?)",
+            (slot_n_ai, role, content, _now()),
+        )
+        _db.commit()
+
+
+def ai_get_history(slot_n_ai: int, max_messages: int) -> list[dict]:
+    """Вернуть последние N сообщений в OpenAI-формате (без system).
+    Сортировка по ts asc — старые сначала, чтобы LLM видел хронологию.
+    """
+    with _db_lock:
+        cur = _db.execute(
+            "SELECT role, content FROM ai_messages "
+            "WHERE slot_n_ai = ? ORDER BY ts DESC LIMIT ?",
+            (slot_n_ai, max_messages),
+        )
+        rows = cur.fetchall()
+    # Развернём обратно: сначала старые, потом новые
+    return [{"role": r["role"], "content": r["content"]} for r in reversed(rows)]
+
+
+def ai_expire_old(ttl_hours: int) -> list[int]:
+    """Удалить чаты с last_used_at старше ttl_hours. Возвращает list of slot_n_ai."""
+    cutoff = _now() - ttl_hours * 3600
+    with _db_lock:
+        cur = _db.execute(
+            "SELECT slot_n_ai FROM ai_conversations WHERE last_used_at < ?",
+            (cutoff,),
+        )
+        freed = [r["slot_n_ai"] for r in cur.fetchall()]
+        if freed:
+            placeholders = ",".join("?" * len(freed))
+            _db.execute(
+                f"DELETE FROM ai_messages WHERE slot_n_ai IN ({placeholders})",
+                freed,
+            )
+            _db.execute(
+                f"DELETE FROM ai_conversations WHERE slot_n_ai IN ({placeholders})",
+                freed,
+            )
+            _db.commit()
+    return freed
+
+
+def ai_slot_exists(slot_n_ai: int) -> bool:
+    with _db_lock:
+        cur = _db.execute(
+            "SELECT 1 FROM ai_conversations WHERE slot_n_ai = ?",
+            (slot_n_ai,),
+        )
+        return cur.fetchone() is not None
 
 
 # ---------- favorites (BETA) ----------
@@ -828,17 +989,31 @@ def send_dm_to_pocket(text: str, on_ack=None) -> None:
 
     Synchronous: USB-write блокирует поток на 50–200 мс. Из async-кода
     использовать `send_dm_to_pocket_async` — там это вынесено в thread-pool.
+
+    `MESH_DELIVERY_MODE`: при `"fast"` идёт fire-and-forget (wantAck=False,
+    on_ack игнорируется). При `"reliable"` (default) — стандартный wantAck.
     """
     if _mesh_iface is None:
         raise RuntimeError("Mesh interface not connected")
     with _mesh_send_lock:
-        _mesh_iface.sendText(
-            text,
-            destinationId=POCKET_NODE_ID,
-            wantAck=True,
-            onResponse=on_ack,
-            hopLimit=MESH_HOP_LIMIT,
-        )
+        if MESH_WANT_ACK:
+            _mesh_iface.sendText(
+                text,
+                destinationId=POCKET_NODE_ID,
+                wantAck=True,
+                onResponse=on_ack,
+                hopLimit=MESH_HOP_LIMIT,
+            )
+        else:
+            # Fast mode: fire-and-forget. Никаких ACK / retry / статусов
+            # доставки. Подходит для срочных коротких пакетов когда «лишь бы
+            # быстрее, а не наверняка».
+            _mesh_iface.sendText(
+                text,
+                destinationId=POCKET_NODE_ID,
+                wantAck=False,
+                hopLimit=MESH_HOP_LIMIT,
+            )
 
 
 async def send_dm_to_pocket_async(text: str, on_ack=None) -> None:
@@ -899,6 +1074,9 @@ def pocket_freshness_hint() -> str:
 _RE_SOS            = re.compile(r"^#SOS\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _RE_STANDALONE_CMD = re.compile(r"^!(\w+)(?:\s+(.*))?$", re.DOTALL)
 _RE_SLOT_PREFIX    = re.compile(r"^@(\d+)\s*(.*)$", re.DOTALL)
+# AI helper: «@ai <вопрос>» — новый чат; «@aiN <вопрос>» — продолжение N-го.
+_RE_AI_NEW         = re.compile(r"^@ai\s+(.+)$", re.IGNORECASE | re.DOTALL)
+_RE_AI_FOLLOWUP    = re.compile(r"^@ai(\d+)\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
 def parse_mesh_text(text: str) -> dict:
@@ -906,6 +1084,8 @@ def parse_mesh_text(text: str) -> dict:
 
     Returns one of:
       {"kind": "sos",            "text": str}
+      {"kind": "ai_followup",    "n": int, "text": str}     # @ai1 текст
+      {"kind": "ai_new",         "text": str}               # @ai текст
       {"kind": "standalone_cmd", "cmd": str, "args": str}
       {"kind": "slot_cmd",       "n": int, "cmd": str, "args": str}
       {"kind": "slot_reply",     "n": int, "text": str}
@@ -914,6 +1094,16 @@ def parse_mesh_text(text: str) -> dict:
     m = _RE_SOS.match(text)
     if m:
         return {"kind": "sos", "text": m.group(1).strip()}
+
+    # AI followup `@aiN` ДО общего @N (тот матчил бы «ai1» как N=ai1 и падал).
+    m = _RE_AI_FOLLOWUP.match(text)
+    if m:
+        return {"kind": "ai_followup", "n": int(m.group(1)),
+                "text": m.group(2).strip()}
+
+    m = _RE_AI_NEW.match(text)
+    if m:
+        return {"kind": "ai_new", "text": m.group(1).strip()}
 
     m = _RE_STANDALONE_CMD.match(text)
     if m:
@@ -1134,6 +1324,83 @@ async def _handle_sos(app: Application, sos_text: str) -> None:
     )
 
 
+async def _handle_ai(query: str, *, slot_n_ai: Optional[int]) -> None:
+    """AI helper: запрос с pocket-ноды → ответ от LLM обратно в pocket.
+
+    `slot_n_ai=None` → новый диалог (выделим slot). Иначе — продолжение.
+    Контекст диалога подтягивается из ai_messages (последние AI_MAX_HISTORY).
+    """
+    if not AI_ENABLED:
+        await send_dm_to_pocket_async(
+            "AI off. Включи AI_ENABLED=true в .env (нужен LM Studio локально)."
+        )
+        return
+
+    query = (query or "").strip()
+    if not query:
+        await send_dm_to_pocket_async("AI: пустой запрос.")
+        return
+
+    # Slot management: новый или существующий
+    if slot_n_ai is None:
+        slot = ai_alloc_slot()
+        history = []
+    else:
+        if not ai_slot_exists(slot_n_ai):
+            await send_dm_to_pocket_async(
+                f"@ai{slot_n_ai} не активен. Используй просто «@ai <вопрос>» для нового чата."
+            )
+            return
+        ai_touch_slot(slot_n_ai)
+        slot = slot_n_ai
+        history = ai_get_history(slot, AI_MAX_HISTORY)
+
+    # Сохраняем user-сообщение СРАЗУ — на случай если LLM упадёт, контекст
+    # не потеряется (юзер сможет переспросить, история уже там).
+    ai_save_message(slot, "user", query)
+
+    # Строим payload: system + история + новый user-вопрос
+    messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
+    messages.extend(history)
+    messages.append({"role": "user", "content": query})
+
+    try:
+        answer = await ai_helper.chat(
+            messages,
+            model=AI_MODEL,
+            base_url=AI_BASE_URL,
+            api_key=AI_API_KEY,
+            timeout_sec=AI_TIMEOUT_SEC,
+        )
+    except Exception as exc:
+        log.exception("AI request failed")
+        await send_dm_to_pocket_async(
+            f"@ai{slot} ошибка: {type(exc).__name__}. Проверь LM Studio."
+        )
+        return
+
+    # Сохраняем ответ в историю (не системный — system промпт не пишем).
+    ai_save_message(slot, "assistant", answer)
+
+    # Шлём обратно в pocket. С префиксом @aiN — в стиле наших обычных слотов.
+    # Длинный ответ режется на чанки тем же _chunk_text как в handle_text.
+    full = f"@ai{slot} {answer}"
+    if len(full) <= MAX_TEXT_LENGTH:
+        await send_dm_to_pocket_async(full)
+        return
+    # Multi-chunk: первый чанк с префиксом и i/N, остальные — продолжение
+    chunk_room = max(40, MAX_TEXT_LENGTH - 25)
+    parts = _chunk_text(answer, chunk_room)
+    for i, part in enumerate(parts):
+        prefix = f"@ai{slot} {i + 1}/{len(parts)}"
+        out = f"{prefix} {part}"
+        try:
+            await send_dm_to_pocket_async(out)
+            await asyncio.sleep(0.4)
+        except Exception:
+            log.exception("AI chunk send failed (best-effort, continuing)")
+
+
 async def _handle_mesh_event(app: Application, evt: dict) -> None:
     kind = evt.get("kind")
 
@@ -1162,6 +1429,14 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
     # SOS — panic broadcast.
     if kind == "sos":
         await _handle_sos(app, parsed["text"])
+        return
+
+    # AI helper: «@ai <вопрос>» — новый чат / «@aiN <вопрос>» — продолжение.
+    if kind == "ai_new":
+        await _handle_ai(parsed["text"], slot_n_ai=None)
+        return
+    if kind == "ai_followup":
+        await _handle_ai(parsed["text"], slot_n_ai=int(parsed["n"]))
         return
 
     if kind == "standalone_cmd":
@@ -1282,6 +1557,11 @@ async def expiry_worker(app: Application) -> None:
                 # Retry rows for now-expired slots are orphaned — clean them.
                 for n in freed:
                     retry_delete_for_slot(n)
+            # AI conversations: чистим неактивные старше AI_TTL_HOURS
+            if AI_ENABLED:
+                ai_freed = ai_expire_old(AI_TTL_HOURS)
+                if ai_freed:
+                    log.info("Expired AI conversations: %s", ai_freed)
         except Exception:
             log.exception("expiry_worker failed")
         await asyncio.sleep(60)
@@ -1339,11 +1619,19 @@ async def retry_worker(app: Application) -> None:
                 try:
                     await send_dm_to_pocket_async(row["payload"], on_ack=_on_ack)
                 except Exception:
-                    log.info("retry_id=%s still failing (attempt %d)",
-                             row["id"], row["attempts"] + 1)
-                    base = RETRY_INITIAL_DELAY_MIN * 60
-                    delay = min(base * (2 ** row["attempts"]),
-                                RETRY_MAX_INTERVAL_MIN * 60)
+                    log.info("retry_id=%s still failing (attempt %d, sos=%s)",
+                             row["id"], row["attempts"] + 1, row["is_sos"])
+                    if row["is_sos"]:
+                        # SOS fast-retry: 5 → 15 → 30 → 60 → 120 → 120 ... сек
+                        attempt = row["attempts"]
+                        if attempt < len(_RETRY_SOS_BACKOFF_SEC):
+                            delay = _RETRY_SOS_BACKOFF_SEC[attempt]
+                        else:
+                            delay = _RETRY_SOS_BACKOFF_SEC[-1]
+                    else:
+                        base = RETRY_INITIAL_DELAY_MIN * 60
+                        delay = min(base * (2 ** row["attempts"]),
+                                    RETRY_MAX_INTERVAL_MIN * 60)
                     retry_reschedule(row["id"], _now() + int(delay))
                     continue
 
@@ -1356,7 +1644,10 @@ async def retry_worker(app: Application) -> None:
         except Exception:
             log.exception("retry_worker iteration failed")
 
-        await asyncio.sleep(60)
+        # Раньше было 60 — но при SOS fast-retry интервалы 5-15 сек,
+        # и проверять due-rows раз в минуту не годится. Один SELECT в БД
+        # каждые 5 сек — не нагружает.
+        await asyncio.sleep(5)
 
 
 async def cmd_retry_cb(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1492,17 +1783,45 @@ def _sender_tag(user) -> str:
     return raw[:MAX_USERNAME_IN_PREFIX]
 
 
-def _format_lora_packet(slot_n: int, user, text: str, entry_tag: Optional[str] = None) -> str:
+def _format_lora_packet(slot_n: int, user, text: str, entry_tag: Optional[str] = None,
+                        chunk_idx: int = 0, chunks_total: int = 1) -> str:
     """Mikhail-facing packet format.
 
-    Without tag: "[@3 vasya 16:15] text"
-    With tag:    "[@3 work:vasya 16:15] text"
+    Без tag, один пакет:    "[@3 vasya 16:15] text"
+    С tag:                  "[@3 work:vasya 16:15] text"
+    Multi-chunk (1/N):      "[@3 vasya 16:15 1/3] beginning..."
+    Multi-chunk (2/N):      "[@3 vasya 16:15 2/3] continuation..."
     """
     ts = datetime.now().strftime("%H:%M")
     sender = _sender_tag(user)
     if entry_tag:
         sender = f"{entry_tag[:6]}:{sender}"
+    if chunks_total > 1:
+        return f"[@{slot_n} {sender} {ts} {chunk_idx + 1}/{chunks_total}] {text}"
     return f"[@{slot_n} {sender} {ts}] {text}"
+
+
+def _chunk_text(text: str, max_chars: int) -> list[str]:
+    """Разбивает длинный текст на части по `max_chars`. Стараемся резать
+    по пробелу — слова не рубятся пополам если возможно. Минимум 1 чанк.
+    """
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return [text]
+    chunks: list[str] = []
+    remaining = text
+    while remaining:
+        if len(remaining) <= max_chars:
+            chunks.append(remaining)
+            break
+        # Пытаемся резать по последнему пробелу в окне max_chars
+        window = remaining[:max_chars]
+        cut = window.rfind(" ")
+        if cut < max_chars // 2:  # пробел слишком близко к началу — режем по символам
+            cut = max_chars
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    return chunks
 
 
 # ----- Reply keyboard for public users (TASK-8) -----
@@ -1989,13 +2308,6 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    if len(text) > MAX_TEXT_LENGTH:
-        await update.message.reply_text(
-            f"Слишком длинно ({len(text)}/{MAX_TEXT_LENGTH} симв). Сократи и отправь снова.",
-            reply_markup=PUBLIC_KEYBOARD,
-        )
-        return
-
     if not _mesh_iface:
         await update.message.reply_text(
             "Сейчас не могу передать сообщение, попробуй чуть позже.",
@@ -2007,7 +2319,28 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     n, reused = slot_allocate_or_reuse(u.id)
     slot_set_last_message(n, text)
     tag = user_get_entry_tag(u.id)
-    payload = _format_lora_packet(n, u, text, entry_tag=tag)
+    single_payload = _format_lora_packet(n, u, text, entry_tag=tag)
+
+    # UTF-8 chunking: если итоговый пакет с префиксом больше MAX_TEXT_LENGTH —
+    # разбиваем на части `[@N user time 1/3] ... 2/3] ... 3/3]`, отправляем
+    # подряд. Сейчас best-effort: если какой-то чанк упал, продолжаем
+    # остальные, юзеру говорим что разбито на N частей. Retry-очередь не
+    # используется для multi-chunk (она хранит один payload).
+    chunked_payloads: list[str] = []
+    if len(single_payload) <= MAX_TEXT_LENGTH:
+        payload = single_payload
+    else:
+        # Резерв на «X/Y» в префиксе плюс пробел — ~6 символов сверху обычного
+        chunk_room = max(40, MAX_TEXT_LENGTH - 30)
+        text_chunks = _chunk_text(text, chunk_room)
+        chunked_payloads = [
+            _format_lora_packet(
+                n, u, ct, entry_tag=tag,
+                chunk_idx=i, chunks_total=len(text_chunks),
+            )
+            for i, ct in enumerate(text_chunks)
+        ]
+        payload = chunked_payloads[0]   # на retry/ACK кладём первый чанк
 
     # Параллельно: TG-статус (HTTP к Telegram, ~500–1000 мс) и LoRa-передача
     # (USB+эфир, обычно сравнимо). Раньше это шло последовательно, экономим
@@ -2050,6 +2383,16 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         send_failed = exc
         log.exception("Initial send to pocket failed")
 
+    # Multi-chunk: первый чанк ушёл — досылаем остальные подряд (best-effort,
+    # без retry / ACK). Между ними небольшая пауза чтобы не перегружать LoRa.
+    if send_failed is None and len(chunked_payloads) > 1:
+        for extra in chunked_payloads[1:]:
+            try:
+                await asyncio.sleep(0.4)
+                await send_dm_to_pocket_async(extra)
+            except Exception:
+                log.exception("Multi-chunk follow-up send failed (best-effort, continuing)")
+
     # Дожидаемся placeholder для последующих edit'ов. Если он упал
     # (TG NetworkError) — деградируем чисто: без placeholder'а, но
     # ack-flow по-прежнему отработает.
@@ -2063,14 +2406,25 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if status_msg is not None:
             now = _now()
             deadline = now + (SLOT_STICKY_HOURS if reused else SLOT_TTL_HOURS) * 3600
+            # SOS fast-retry: текст содержит #SOS / срочно / urgent →
+            # короткие интервалы (5/15/30/60/120 сек) и сразу первая попытка.
+            urgent = _is_urgent(text)
+            initial_delay = _RETRY_SOS_BACKOFF_SEC[0] if urgent else RETRY_INITIAL_DELAY_MIN * 60
             retry_id = retry_enqueue(
                 u.id, update.effective_chat.id, status_msg.message_id,
-                n, payload, deadline, RETRY_INITIAL_DELAY_MIN * 60,
+                n, payload, deadline, initial_delay,
+                is_sos=urgent,
             )
-            queue_text = (
-                f"⏳ {DISPLAY_NAME} пока вне связи. Сообщение в очереди — "
-                "попробую автоматически в ближайшие минуты."
-            )
+            if urgent:
+                queue_text = (
+                    f"⏳ {DISPLAY_NAME} пока вне связи. Срочное сообщение в "
+                    "очереди — повторяю каждые несколько секунд."
+                )
+            else:
+                queue_text = (
+                    f"⏳ {DISPLAY_NAME} пока вне связи. Сообщение в очереди — "
+                    "попробую автоматически в ближайшие минуты."
+                )
             await _show_status(
                 update, status_msg, queue_text,
                 reply_markup=_retry_inline_markup(retry_id),
@@ -2088,7 +2442,13 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     # Success branch — fresh vs stale hint for the user.
     hint = pocket_freshness_hint()
-    success_text = "📨 Сообщение отправлено. Ответ обычно в течение 2–5 минут."
+    if len(chunked_payloads) > 1:
+        success_text = (
+            f"📨 Длинное сообщение разбито на {len(chunked_payloads)} частей и "
+            "отправлено. Ответ обычно в течение 2–5 минут."
+        )
+    else:
+        success_text = "📨 Сообщение отправлено. Ответ обычно в течение 2–5 минут."
     if hint:
         success_text += "\n" + hint.strip()
     if status_msg is not None:

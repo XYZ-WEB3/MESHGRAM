@@ -1,39 +1,45 @@
+**Read in:** English · [Русский](README.ru.md)
+
 # Meshgram
 
-Личный мост между Telegram и Meshtastic LoRa-сетью. Чтобы с тобой можно было связаться даже без интернета — лишь бы карманная LoRa-нода была в зоне приёма.
+A personal bridge between Telegram and a Meshtastic LoRa mesh. Reachable when you have no internet — as long as your pocket node holds a mesh signal.
 
-🌐 [meshgram.site](https://meshgram.site)
-📂 Прежняя версия (ноябрь 2025): [github.com/XYZ-WEB3/MESHGRAM @ tag old](https://github.com/XYZ-WEB3/MESHGRAM)
+[meshgram.site](https://meshgram.site) · [previous prototype (Nov 2025)](https://github.com/XYZ-WEB3/MESHGRAM/tree/old)
 
-## Как это работает
+## Architecture
 
 ```
-TG-юзер → Telegram-бот → home-нода (USB) ──LoRa DM──► карманная нода
-                                                            ↓
-                                                       ты читаешь, отвечаешь
-                                                            ↓
-TG-юзер ← Telegram-бот ← home-нода ──LoRa DM──◄ карманная нода
+Telegram user → Telegram bot → home node (USB) ──LoRa DM──► pocket node
+                                                                 ↓
+                                                            read / reply
+                                                                 ↓
+Telegram user ← Telegram bot ← home node ──LoRa DM──◄ pocket node
 ```
 
-Каждое сообщение получает свой слот `@N`. Ответ на конкретный `@N` уходит конкретному человеку — никакого общего чата. Между двумя нодами идёт зашифрованный DM, чужие узлы на канале только ретранслируют пакет.
+Every Telegram conversation is assigned a short slot `@N`. A reply addressed to that slot goes back to the original sender — no shared chat, no broadcast. The two nodes communicate over an encrypted DM; other nodes on the channel only relay the packet.
 
-## Что умеет
+## Capabilities
 
-- **Слоты `@N`** со sticky-логикой — переписка с одним человеком всегда на одном номере, повторные сообщения от него ложатся туда же
-- **Статусы доставки** как в мессенджере: «передаю → отправлено → ✓ доставлено → ответ»
-- **Авто-ретраи** при потере связи (очередь в SQLite, переживает рестарт)
-- **Категории / реферальные ссылки** — `t.me/bot?start=work` для коллег, `?start=family` для семьи; у тебя в кармане видно «откуда» каждое сообщение
-- **GPS / `/where`** — координаты для избранных пользователей (бета)
-- **SOS** — триггер `#SOS` с карманной ноды → веерная рассылка списку получателей
-- **Whitelist** — закрытый режим, бан-лист, избранные
-- **GUI на PyQt6** — настройки, юзеры, активные слоты, лог релея, выбор модели ноды (50 SVG)
+- **Sticky slots `@N`** — a single number stays with each contact across multiple messages. The pocket-node screen is therefore predictable.
+- **Delivery statuses** comparable to any messenger: *sending → sent → delivered → reply*.
+- **Auto-retry queue** — if the pocket is offline, outgoing messages are persisted in SQLite and re-sent later. Survives a process restart.
+- **Categories and referral links** — `t.me/bot?start=work`, `?start=family`. The category prefix is shown next to the sender so context is obvious.
+- **GPS via `/where`** (beta) — current coordinates available only to whitelisted contacts.
+- **SOS** — `#SOS <text>` from the pocket node fans the message out to a configured recipient list, optionally with coordinates.
+- **Whitelist mode** — closed bot, ban list, favorites.
+- **PyQt6 desktop client** — settings, user list, active slots, live relay log, node-model picker covering 50 boards.
+- **Long-message chunking** — input over the LoRa frame limit is split into `[1/N] … [N/N]` parts automatically.
+- **Speed / reliability toggle** — `MESH_DELIVERY_MODE=fast` switches to fire-and-forget for short urgent messages, `reliable` (default) keeps ACKs and retries.
+- **SOS fast-retry** — messages containing `#SOS`, `urgent` or equivalent are retried at 5/15/30/60/120 second intervals instead of the regular 2–15 minute back-off.
+- **AI helper** (optional, off by default) — write `@ai <question>` from the pocket node and a local LLM responds. Continue the dialogue with `@aiN <question>`. Works against any OpenAI-compatible endpoint; the default config targets [LM Studio](https://lmstudio.ai/) on `localhost:1234`, so messages stay on-device. System prompt and TTL are configurable.
 
-## Установка
+## Install
 
-Нужно:
-- Python 3.10+
-- Две Meshtastic-совместимые ноды
-- Telegram-бот ([@BotFather](https://t.me/BotFather)) и свой numeric ID ([@my_id_bot](https://t.me/my_id_bot))
+Requirements:
+
+- Python 3.10 or newer
+- Two Meshtastic-compatible LoRa nodes
+- A Telegram bot from [@BotFather](https://t.me/BotFather) and your numeric Telegram ID from [@my_id_bot](https://t.me/my_id_bot)
 
 ```bash
 git clone https://github.com/XYZ-WEB3/MESHGRAM.git
@@ -41,63 +47,62 @@ cd MESHGRAM
 pip install -r requirements.txt
 ```
 
-### С GUI (Windows)
+### Windows (GUI)
 
-Двойной клик по `relay\run_gui.bat`. На первом запуске откроется wizard в три шага: токен → твой Telegram ID → ID карманной ноды → выбор COM-порта → Старт.
+Double-click `relay\run_gui.bat`. On the first run, a wizard collects the bot token, your Telegram ID, the pocket-node ID and the COM port.
 
-### Без GUI (любая ОС)
+### Windows (CLI) / macOS / Linux
 
 ```bash
 cp relay/.env.example relay/.env
-# отредактируй .env: BOT_TOKEN, OWNER_ID, POCKET_NODE_ID
+# edit .env: BOT_TOKEN, OWNER_ID, POCKET_NODE_ID
 cd relay
-python relay.py --port COM3        # Windows
-python relay.py --port /dev/ttyUSB0 # Linux/macOS
+python relay.py --port COM3          # Windows
+python relay.py --port /dev/ttyUSB0   # Linux / macOS
 ```
 
-Под Linux можно подвесить через systemd — пример unit-файла в [relay/README.md](relay/README.md#cli--headless).
+A bash launcher (`relay/run_relay.sh`) is provided as a convenience — it creates a `venv`, installs dependencies and lists serial devices. For a production deployment on Linux see [`relay/deploy/INSTALL_LINUX.md`](relay/deploy/INSTALL_LINUX.md), which includes a `systemd` unit template.
 
-## Дорожная карта
+## Project status
 
-**Сделано**
+### Shipped
 
-- **ноябрь 2025** — первый прототип в этом же репо: простой мост Telegram ↔ Meshtastic broadcast, без адресности
-- **зима 2025/26** — концептуальный пересмотр: уход от общего чата к адресной маршрутизации (слоты `@N`)
-- **март 2026** — UI-прототип с дизайнером
-- **апрель 2026** — текущая версия:
-  - переписан под слоты `@N` со sticky-логикой
-  - ACK по LoRa + retry queue в SQLite
-  - GPS / `/where` (бета), SOS, whitelist, категории
-  - PyQt6 GUI портирован по дизайнерскому референсу
-  - каталог 50 моделей нод с SVG-превью
-  - сайт meshgram.site (Caddy + Let's Encrypt)
+- **Slot routing v1** — sticky `@N` slots replacing the earlier broadcast bridge
+- **LoRa-side acknowledgements** — wantAck-based delivery statuses, retry queue with exponential back-off
+- **GPS / `/where` (beta)**, SOS, whitelist, categories
+- **PyQt6 desktop client** with a 50-model node picker
+- **meshgram.site** landing page (Caddy + Let's Encrypt)
+- **Latency batch** — TG → pocket reduced from 10–15 s to about 3 s (see [CHANGES.md](CHANGES.md))
+- **Linux support** — `.sh` launchers, `systemd` unit, install guide
+- **UTF-8 chunking** of long messages, speed/reliability toggle, fast-retry for urgent messages
 
-**В планах**
+### In progress
 
-- 🐧 Linux — `.sh` лаунчеры, тесты на Ubuntu/Debian/Fedora
-- 📡 Wi-Fi/TCP подключение к ноде вместо USB
-- 👥 Multi-user — одно приложение держит 5+ ботов с одной шлюзовой нодой
-- 🤖 AI-помощник — авто-ответы / черновики / суммаризация через OpenAI-совместимый API (cloud или local через [LM Studio](https://lmstudio.ai/))
-- 🗺 Карта в GUI для GPS-позиции
-- ⚙️ Команды управления нодой (мощность LoRa, role, регион, рестарт) прямо из GUI
-- 🌐 Свои ноды-ретрансляторы по городу с ролью ROUTER
-- 🔁 Auto-restart при сетевых сбоях
-- 📦 Установочные пакеты (deb / AUR)
+- **Cloud mode (MQTT / TCP)** — instead of running `relay.py` locally, the user keeps only a Wi-Fi node on the windowsill; the relay process runs on the project's VPS. Scaffold is in [`cloud/`](cloud/) and the MQTT broker is deployed; integration is paused pending a stable Meshtastic firmware release. Removes the need for a local PC and, in regions with restricted Telegram access, the need for a local VPN.
 
-Подробности по архитектуре, всем командам и конфигу — в [relay/README.md](relay/README.md).
+### Planned
 
-## Стек
+- **Multi-user** — one process serving several bots through a single gateway node
+- **Map in the GUI** — Leaflet/OSM view of the latest pocket-node GPS fix
+- **In-GUI node controls** — LoRa transmit power, role, region, reboot
+- **Self-hosted ROUTER coverage** — guide for setting up router-role nodes for city-scale reach
+- **Distributable packages** — `.deb` for Debian/Ubuntu, AUR for Arch, PyInstaller bundle for Windows
+- **Localisation** — English and Spanish translations of the site, bot and CLI
 
-Python 3.10+ · PyQt6 · python-telegram-bot · meshtastic-python · SQLite · Caddy + Let's Encrypt (для сайта)
+A more detailed roadmap and per-feature task list lives in [CHANGES.md](CHANGES.md). Architecture and command reference: [relay/README.md](relay/README.md).
 
-## Кредиты
+## Stack
 
-- [Meshtastic](https://meshtastic.org/) — open-source LoRa-mesh, на котором всё работает
-- SVG-картинки моделей нод в [`relay/devices/`](relay/devices) — взяты с [официальной документации Meshtastic](https://meshtastic.org/docs/hardware/devices/)
-- Иконки UI нарисованы в стиле Lucide / Feather
+Python 3.10+, PyQt6, python-telegram-bot, meshtastic-python, SQLite (WAL), Caddy + Let's Encrypt for the website, optional Mosquitto for the cloud mode.
 
-Проект не аффилирован с Meshtastic, использует только публичный SDK и открытые иллюстрации с их сайта.
+## Credits
 
-## Лицензия
+- [Meshtastic](https://meshtastic.org/) — the open-source LoRa-mesh project this is built on
+- Node-model SVGs in [`relay/devices/`](relay/devices) come from the [official Meshtastic documentation](https://meshtastic.org/docs/hardware/devices/)
+- UI icons follow the Lucide / Feather visual language
 
-[MIT](LICENSE). Сольный любительский проект, не для коммерции — issues и PR приветствуются, но без гарантий и SLA.
+Not affiliated with Meshtastic; uses only the public SDK and open assets.
+
+## License
+
+[MIT](LICENSE). A single-author hobby project; issues and pull requests are welcome but the code is provided as-is with no SLA.

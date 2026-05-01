@@ -4,6 +4,126 @@
 
 ---
 
+## v0.7 — AI-помощник через локальную LLM
+
+С карманной ноды `@ai <вопрос>` — локальная модель (LM Studio / Ollama / любой OpenAI-совместимый endpoint) отвечает. Продолжение диалога — `@aiN <вопрос>`, история подтягивается в контекст модели. По умолчанию выключен; включается `AI_ENABLED=true` в `.env`.
+
+### Использование
+
+```
+с pocket-ноды:    @ai как форматировать дату в Python
+обратно:          @ai1 datetime.now().strftime("%Y-%m-%d")
+
+с pocket-ноды:    @ai1 а если с миллисекундами?
+обратно:          @ai1 datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+```
+
+Ответы AI шлются обратно в pocket с префиксом `@aiN` — слот за слотом, как у обычных контактов. Длинные ответы автоматически чанкуются (см. v0.6 chunking).
+
+### Настройки в `.env`
+
+```env
+AI_ENABLED=false                                # master-switch
+AI_BASE_URL=http://localhost:1234/v1            # LM Studio default
+AI_API_KEY=lm-studio                            # любой непустой для LM Studio
+AI_MODEL=llama-3.2-8b-instruct                  # имя загруженной модели
+AI_SYSTEM_PROMPT="Отвечай коротко и ясно. Максимум 2-3 предложения."
+AI_TIMEOUT_SEC=30
+AI_MAX_HISTORY=10                               # сколько последних пар user/assistant в контекст
+AI_TTL_HOURS=168                                # 7 дней — потом slot освобождается
+```
+
+### Реализация
+
+- **`relay/ai_helper.py`** — асинхронная обёртка над `openai>=1.0` (`AsyncOpenAI`). Ленивая инициализация: если пакет не установлен или endpoint недоступен — релей продолжает работать, ошибка пишется в лог, юзеру отвечает `@ai{N} ошибка: <тип>. Проверь LM Studio.`
+- **БД**: новые таблицы `ai_conversations` (slot_n_ai PRIMARY KEY + created_at + last_used_at) и `ai_messages` (history с role/content/ts). Миграция из старой схемы — через `CREATE TABLE IF NOT EXISTS`.
+- **Хелперы** в `relay.py`: `ai_alloc_slot`, `ai_touch_slot`, `ai_save_message`, `ai_get_history`, `ai_expire_old`, `ai_slot_exists`. Аналогично slot-helpers для обычных юзеров.
+- **Парсер**: новые `_RE_AI_NEW` (`@ai <текст>`) и `_RE_AI_FOLLOWUP` (`@aiN <текст>`) проверяются ДО общего `@N` regex (иначе «@ai1» матчился бы как slot=ai1 и падал).
+- **Диспатчер**: в `_handle_mesh_event` добавлены ветки `ai_new` и `ai_followup` → вызывают `_handle_ai(query, slot_n_ai=None|N)`.
+- **Expiry**: `ai_expire_old(ttl_hours)` интегрирован в `expiry_worker` — раз в минуту удаляет неактивные диалоги старше TTL.
+
+### Privacy
+
+При работе с **локальным LM Studio** переписка не покидает устройство. Для облачных провайдеров (OpenAI, Anthropic, etc.) — поменяй `AI_BASE_URL` и `AI_API_KEY`, но помни что в этом случае ваша переписка отправляется в облако того провайдера.
+
+---
+
+## v0.6 — UX-фиксы и Linux-поддержка
+
+### ⚡ SOS fast-retry для срочных сообщений
+
+Раньше: ретрай-очередь с экспоненциальным backoff'ом (2 → 4 → 8 → 15 минут). Для обычной переписки норм, для срочного сообщения — катастрофа.
+
+Теперь: если в тексте есть `#SOS`, `срочно`, `urgent` или `emergency` — короткие интервалы **5 → 15 → 30 → 60 → 120 секунд**. Срабатывает автоматически по детектору `_is_urgent(text)`.
+
+Реализация:
+- В `retry_queue` добавлен флаг `is_sos INTEGER NOT NULL DEFAULT 0` с миграцией для старых БД
+- `retry_enqueue(..., is_sos=False)` — параметр флага
+- `retry_worker` для `is_sos=True` использует таблицу `_RETRY_SOS_BACKOFF_SEC = (5, 15, 30, 60, 120)`
+- Poll-интервал воркера снижен с 60 до 5 секунд (один SELECT в БД, нагрузка нулевая)
+- Юзер видит другой статус: «срочное сообщение в очереди — повторяю каждые несколько секунд»
+
+### 🚀 Speed / Reliability toggle
+
+Новый ключ `MESH_DELIVERY_MODE` в `.env`:
+
+```env
+MESH_DELIVERY_MODE=reliable    # default — wantAck=True, ретраи, статусы
+MESH_DELIVERY_MODE=fast        # fire-and-forget — wantAck=False, без ACK/retry
+```
+
+**`reliable`**: как сейчас — `wantAck=True`, есть «✓ Доставлено», retry если не дошло, тратится 1-3 сек на ACK-ожидание.
+
+**`fast`**: fire-and-forget. Никаких подтверждений, никаких ретраев, мгновенная отправка. Для срочных коротких пакетов когда «лишь бы быстрее, а не наверняка». Поведение firmware идентично, просто без круга ACK.
+
+Валидация в `settings.py:validate()` — пускает только два значения.
+
+### ✂️ UTF-8 chunking для длинных сообщений
+
+Раньше: при `len(text) > 170` юзер получал отлуп «Слишком длинно, сократи и отправь снова». Это плохой UX — в эпоху мессенджеров без лимитов люди не привыкли считать символы.
+
+Теперь: если сообщение не влезает в один LoRa-пакет, оно разбивается на части `[@N user 14:32 1/3] начало... 2/3] середина... 3/3] конец`. Михаил на pocket-ноде видит части последовательно. Для юзера в TG — никаких ограничений, просто статус «📨 Длинное сообщение разбито на 3 части и отправлено».
+
+Реализация:
+- Новая утилита `_chunk_text(text, max_chars)` — режет по словам (по последнему пробелу в окне), не рубит слова посередине если возможно
+- `_format_lora_packet(...)` принимает `chunk_idx, chunks_total` — добавляет `i/N` в префикс если нужно
+- Multi-chunk шлётся через первый пакет (под ACK + retry-очередь) + остальные подряд best-effort с `asyncio.sleep(0.4)` между ними чтобы не перегружать LoRa-канал
+- Если первый чанк упал → ретрай как обычно; остальные не пересылаются (юзер видит «не доставлено», шлёт ещё раз — заново разбивается)
+- Если первый ушёл, а второй упал → лог-предупреждение, юзер видит «отправлено» (на pocket пришла только первая часть, но это редкий edge-case)
+
+### 🐧 Linux-поддержка (run_relay.sh + run_gui.sh + systemd)
+
+Раньше из коробки только `.bat`-лаунчеры — Linux-юзеры (а это большая часть mesh-комьюнити, кто на Raspberry Pi) пролетали.
+
+Теперь:
+- `relay/run_relay.sh` — bash-аналог `run_relay.bat`. Создаёт venv на первом запуске, ставит зависимости, листит `/dev/ttyUSB*` + `/dev/ttyACM*` + `/dev/serial/by-id/*`, спрашивает порт.
+- `relay/run_gui.sh` — для GUI с проверкой `$DISPLAY` / `$WAYLAND_DISPLAY`. Если нет иксов — отказывается с подсказкой запустить CLI-вариант.
+- `relay/deploy/meshgram-relay.service` — systemd template для production. С `User=meshgram`, `DeviceAllow=char-ttyUSB rw`, hardening (`NoNewPrivileges`, `ProtectSystem=full`).
+- `relay/deploy/INSTALL_LINUX.md` — пошаговая инструкция для Ubuntu/Debian/Fedora/Arch. Два сценария: «запуск из консоли» (быстро потестить) и «systemd-сервис» (production на VPS / Pi).
+
+### 💾 WAL mode на relay.db
+
+Раньше `relay.db` был в дефолтном journal-режиме — конкурентные read/write блокировали друг друга. С тремя пишущими сторонами (relay.py main loop, retry_worker, GUI) это могло выстрелить «database is locked» при росте нагрузки.
+
+Теперь в `db_init()` сразу после connect:
+
+```python
+_db.execute("PRAGMA journal_mode=WAL;")
+_db.execute("PRAGMA synchronous=NORMAL;")
+```
+
+Аналогично тому что уже было на `site.db` сайта.
+
+### 📖 README двуязычный (EN + RU)
+
+`README.md` теперь главный, на английском (для мирового LoRa-комьюнити, которое 99% не читает по-русски). Сверху ссылка-переключатель `**Read in:** English · [Русский](README.ru.md)`. Перевод авторский, не машинный — соответствует тону оригинала.
+
+`README.ru.md` — русская версия с тем же контентом и переключателем обратно. Оба упоминают новый Cloud-режим как planned.
+
+Для бота `@MeshgramDemoBot` параллельно сделана инфраструктура i18n (см. `site/demo_bot/i18n.py`) — но это в репозитории не публикуется (отдельный приватный сервис).
+
+---
+
 ## v0.5.1 — стабильность и скорость
 
 ### 🛡 Auto-restart на сетевых сбоях Telegram

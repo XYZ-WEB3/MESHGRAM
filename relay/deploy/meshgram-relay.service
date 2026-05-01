@@ -1,0 +1,41 @@
+[Unit]
+Description=Meshgram Relay (Telegram <-> Meshtastic LoRa)
+After=network.target
+# Если используешь VPN-туннель к Telegram — раскомментируй и подставь
+# имя своего VPN-юнита (например wg-quick@wg0.service или openvpn-client@*).
+# After=network.target wg-quick@wg0.service
+# Wants=wg-quick@wg0.service
+
+[Service]
+Type=simple
+
+# Меняй User/Group на своего юзера-операнда. Стандартно — `meshgram`.
+# Создать юзера: sudo useradd --system --home /opt/meshgram --shell /bin/false meshgram
+# В group dialout/uucp его ДОЛЖНО быть для доступа к /dev/ttyUSB*:
+#   sudo usermod -a -G dialout meshgram   # Ubuntu/Debian
+#   sudo usermod -a -G uucp    meshgram   # Arch
+User=meshgram
+Group=meshgram
+
+WorkingDirectory=/opt/meshgram/relay
+EnvironmentFile=/opt/meshgram/relay/.env
+ExecStart=/opt/meshgram/relay/.venv/bin/python relay.py
+Restart=on-failure
+RestartSec=10
+
+StandardOutput=journal
+StandardError=journal
+
+# Hardening — относительно безопасные дефолты
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/meshgram/relay
+# Нужен доступ к /dev/ttyUSB*; если не хочешь полного, можно через udev-правило
+# дать конкретный device-path — здесь в простоте используем DeviceAllow:
+DeviceAllow=char-ttyUSB rw
+DeviceAllow=char-ttyACM rw
+
+[Install]
+WantedBy=multi-user.target

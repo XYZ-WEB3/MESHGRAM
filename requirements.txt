@@ -3,3 +3,7 @@ python-telegram-bot>=20.0
 pypubsub
 pyserial>=3.5
 PyQt6>=6.5
+
+# AI helper (опционально, активируется AI_ENABLED=true в .env).
+# Совместим с LM Studio / Ollama / OpenAI / любым OpenAI-API-endpoint.
+openai>=1.0

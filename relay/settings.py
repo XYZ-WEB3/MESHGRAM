@@ -52,6 +52,14 @@ DEFAULTS: dict[str, Any] = {
     # и нужны промежуточные ноды-ретрансляторы.
     "mesh_hop_limit": 1,
 
+    # Режим доставки:
+    #   "reliable" (default) — wantAck=True, есть «✓ Доставлено» / NAK,
+    #     ретраи если не дошло. Чуть медленнее (ждём ACK ~1-3 с).
+    #   "fast"               — wantAck=False, fire-and-forget. Никаких
+    #     подтверждений, никаких retry, мгновенно. Подходит для коротких
+    #     срочных сообщений когда «лишь бы быстрее, а не наверняка».
+    "mesh_delivery_mode": "reliable",
+
     # --- Limits ---
     "max_text_length":        170,
     "slot_ttl_hours":         20,
@@ -86,13 +94,36 @@ DEFAULTS: dict[str, Any] = {
     "log_file_enabled": True,
     "log_file_max_mb":  5,    # размер одного файла перед ротацией
     "log_file_keep":    5,    # сколько бэкапов хранить (relay.log.1 .. .5)
+
+    # --- AI helper (locally via LM Studio / Ollama / любой OpenAI-compatible) ---
+    # Использование: с pocket-ноды напиши «@ai <вопрос>» — придёт ответ
+    # на новом slot'е (@ai1, @ai2, ...). Продолжение диалога — «@aiN <текст>»,
+    # бот подтянет историю чата для контекста.
+    "ai_enabled":        False,
+    # OpenAI-compatible base URL. LM Studio на дефолтном порту слушает 1234.
+    "ai_base_url":       "http://localhost:1234/v1",
+    # API key. LM Studio принимает любой непустой; для облачных провайдеров
+    # ставь свой реальный.
+    "ai_api_key":        "lm-studio",
+    # Имя модели. В LM Studio это слаг загруженной модели (см. вкладку Models).
+    "ai_model":          "llama-3.2-8b-instruct",
+    # Системный промпт — задаёт тон и краткость. Меняй под свою задачу.
+    "ai_system_prompt":  "Отвечай коротко и ясно. Максимум 2-3 предложения. "
+                         "Без лишних объяснений и приветствий.",
+    # Таймаут одного запроса. На локальной модели обычно 5-15 сек.
+    "ai_timeout_sec":    30,
+    # Сколько последних пар user/assistant включать в контекст (помимо system).
+    "ai_max_history":    10,
+    # TTL диалога. После N часов неактивности slot ai_N освобождается.
+    "ai_ttl_hours":      168,   # 7 дней
 }
 
 
 # Keys grouped for nice .env formatting.
 GROUPS: list[tuple[str, list[str]]] = [
     ("Connection", ["bot_token", "owner_id", "pocket_node_id", "last_com_port",
-                    "display_name", "node_model", "mesh_hop_limit"]),
+                    "display_name", "node_model", "mesh_hop_limit",
+                    "mesh_delivery_mode"]),
     ("Limits", ["max_text_length", "slot_ttl_hours", "slot_sticky_hours",
                 "max_username_in_prefix", "pocket_fresh_min", "pocket_stale_min"]),
     ("GPS (BETA — not tested by author)", [
@@ -103,6 +134,10 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("SOS", ["sos_enabled", "sos_message", "sos_include_coords", "sos_recipients"]),
     ("Delivery / retry", ["retry_initial_delay_min", "retry_max_interval_min"]),
     ("Logging", ["log_file_enabled", "log_file_max_mb", "log_file_keep"]),
+    ("AI helper (LM Studio / Ollama / OpenAI-compatible)", [
+        "ai_enabled", "ai_base_url", "ai_api_key", "ai_model",
+        "ai_system_prompt", "ai_timeout_sec", "ai_max_history", "ai_ttl_hours",
+    ]),
 ]
 
 
@@ -215,13 +250,18 @@ def validate(data: dict[str, Any]) -> list[str]:
                 "where_rate_limit_min", "retry_initial_delay_min",
                 "retry_max_interval_min",
                 "log_file_max_mb", "log_file_keep",
-                "mesh_hop_limit"):
+                "mesh_hop_limit",
+                "ai_timeout_sec", "ai_max_history", "ai_ttl_hours"):
         try:
             v = int(s[key])
             if v < 0:
                 errs.append(f"{key} не может быть отрицательным.")
         except (TypeError, ValueError):
             errs.append(f"{key} должно быть числом.")
+
+    mode = str(s.get("mesh_delivery_mode") or "reliable").lower()
+    if mode not in ("reliable", "fast"):
+        errs.append("MESH_DELIVERY_MODE должен быть 'reliable' или 'fast'.")
 
     return errs
 
