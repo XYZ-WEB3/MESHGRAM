@@ -4,6 +4,51 @@
 
 ---
 
+## v0.7.3 — настройки в GUI, AI-конфиг, security audit
+
+### Settings GUI: 4 новые секции
+
+В `Meshgram.exe` без правки `.env` руками теперь редактируется всё:
+
+- **Mesh · LoRa** — `MESH_HOP_LIMIT` (1 для прямой видимости, 3 для через ROUTER-ноды) и переключатель Reliable / Fast (фича `MESH_DELIVERY_MODE` из v0.6, до сих пор настраивалась только в `.env`)
+- **AI-помощник** — все 9 ключей плюс кнопка **Test connection** к OpenAI-совместимому endpoint'у и **dropdown с автозагрузкой моделей** через `GET /v1/models`
+- **Логи** — `LOG_FILE_ENABLED`, `LOG_FILE_MAX_MB`, `LOG_FILE_KEEP`
+- **Интерфейс** — переключатель языка (RU / EN) с уведомлением «применится после перезапуска»
+
+Существующая секция Limits уже содержала retry-настройки (`RETRY_INITIAL_DELAY_MIN`, `RETRY_MAX_INTERVAL_MIN`) — ничего там не дублирую.
+
+### AI helper: настраиваемый тег команды
+
+Раньше `@ai <вопрос>` был захардкожен в regex. Теперь `AI_TRIGGER_TAG` в настройках (default `ai`, можно `gpt`, `llm` и т.п.). Regex'ы компилируются динамически при старте релея с учётом текущего тега. Все ответы AI пользователю используют этот же тег (`@<tag>N <answer>`).
+
+`ai_helper.list_models(base_url, api_key)` — синхронный HTTP-клиент через `requests` для GET `/v1/models`. Используется в Settings dialog для авто-заполнения dropdown'а — кнопка **⟳** опрашивает endpoint, на основе ответа заполняется список моделей. Кнопка **«Проверить подключение»** отдельно показывает «✓ N моделей доступно» либо ошибку.
+
+### Локализация GUI: меню и toolbar
+
+`gui.py:_build_menu()` теперь использует `i18n_gui.t()` для всех QAction'ов. Файл / Правка / Вид / Сервис / Справка и все элементы под ними переведены на EN. После сохранения нового языка в Settings показывается уведомление, что для полного применения нужен перезапуск (трей и диалоги обновляются на лету).
+
+### Security audit fixes
+
+Внешний аудит обнаружил 4 critical и 5 high. Исправлено:
+
+- **C1+C2**: Caddyfile получил path-based deny через `path_regexp` для `*.py`, `*.env`, `*.db`, `*.spec`, `*.log`, `*.key`, `*.pem` плюс директории `/__pycache__/`, `/.git/`, `/deploy/`, `/handlers/`, `/services/`, `/core/`, `/demo_bot/` и явные пути `/backend.py`, `/requirements.txt`. Защита в два уровня: даже если что-то случайно затащено в `/var/www/` через rsync — Caddy отдаст 404, а не прокинет через `try_files` на `index.html`. Дополнительно `site/deploy/DEPLOY.md` обновлён правильными rsync-флагами `--exclude '.env'` `--exclude '*.db'` `--exclude '*.py'` `--exclude 'demo_bot/'` etc.
+
+- **C3** (X-Forwarded-For без trust check): `backend.py:get_client_ip()` теперь доверяет заголовку **только** если запрос пришёл с loopback (Caddy). Любой другой источник → используется `request.client.host` напрямую. Это закрывает обход rate-limit, brute-force админки и накрутку голосов через подделку IP.
+
+- **C4** (Stored XSS): `index.html` в публичной голосовалке экранирует `opt.title` и `opt.desc` через `escapeHtml()`. Раньше шло как `${opt.title}` в `innerHTML` — админ-вью уже было защищено, публичное — нет.
+
+- **H1** (HTML-инъекция через `first_name` в админ-уведомлениях о донатах): `demo_bot/handlers/donate.py:_notify_donation()` теперь `html.escape()` для `username`, `first_name` и `method` перед подстановкой в HTML-сообщение.
+
+- **H3** (CORS с localhost:8765 + credentials): убран `localhost:8765` из `allow_origins`, оставлен только `https://meshgram.site`.
+
+- **H4** (pre_checkout без validation): `demo_bot/handlers/donate.py:on_pre_checkout()` проверяет формат `invoice_payload` — должен быть `donate:stars:<uid>:<amount>:<ts>`. Невалидный → `query.answer(ok=False)` с сообщением.
+
+Что **не делалось**: `H2` (один пользователь под demo_bot и сайт) — это инфраструктурный refactor, отложен. `H5` (BOT_TOKEN на диске) — design choice, см. README.
+
+Аудит relay-кода (того что в этом репо) ранее проблем не обнаружил.
+
+---
+
 ## v0.7.2 — фиксы wizard'а и архитектуры frozen-сборки
 
 В v0.7.1 готовый `.exe` падал в трёх местах. Этот патч их закрывает.

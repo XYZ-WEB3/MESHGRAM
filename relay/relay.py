@@ -144,6 +144,21 @@ AI_SYSTEM_PROMPT: str    = str(_S.get("ai_system_prompt") or
 AI_TIMEOUT_SEC: int      = int(_S.get("ai_timeout_sec") or 30)
 AI_MAX_HISTORY: int      = int(_S.get("ai_max_history") or 10)
 AI_TTL_HOURS: int        = int(_S.get("ai_ttl_hours") or 168)
+AI_TRIGGER_TAG: str      = (_S.get("ai_trigger_tag") or "ai").strip().lower() or "ai"
+
+
+# AI helper: «@<tag> <вопрос>» — новый чат; «@<tag>N <вопрос>» — продолжение.
+# Тег настраивается в settings.ai_trigger_tag (default «ai»). Меняя его, юзер
+# получает «@gpt», «@llm» и т.п. вместо «@ai» — без правки кода.
+def _compile_ai_regex(tag: str) -> tuple[re.Pattern, re.Pattern]:
+    safe = re.escape(tag or "ai")
+    return (
+        re.compile(rf"^@{safe}\s+(.+)$", re.IGNORECASE | re.DOTALL),
+        re.compile(rf"^@{safe}(\d+)\s+(.+)$", re.IGNORECASE | re.DOTALL),
+    )
+
+
+_RE_AI_NEW, _RE_AI_FOLLOWUP = _compile_ai_regex(AI_TRIGGER_TAG)
 
 # SQLite file next to this script.
 # DB лежит рядом с пользовательским .env. В frozen .exe — рядом с .exe,
@@ -1080,9 +1095,6 @@ def pocket_freshness_hint() -> str:
 _RE_SOS            = re.compile(r"^#SOS\b\s*(.*)$", re.IGNORECASE | re.DOTALL)
 _RE_STANDALONE_CMD = re.compile(r"^!(\w+)(?:\s+(.*))?$", re.DOTALL)
 _RE_SLOT_PREFIX    = re.compile(r"^@(\d+)\s*(.*)$", re.DOTALL)
-# AI helper: «@ai <вопрос>» — новый чат; «@aiN <вопрос>» — продолжение N-го.
-_RE_AI_NEW         = re.compile(r"^@ai\s+(.+)$", re.IGNORECASE | re.DOTALL)
-_RE_AI_FOLLOWUP    = re.compile(r"^@ai(\d+)\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
 def parse_mesh_text(text: str) -> dict:
@@ -1354,7 +1366,8 @@ async def _handle_ai(query: str, *, slot_n_ai: Optional[int]) -> None:
     else:
         if not ai_slot_exists(slot_n_ai):
             await send_dm_to_pocket_async(
-                f"@ai{slot_n_ai} не активен. Используй просто «@ai <вопрос>» для нового чата."
+                f"@{AI_TRIGGER_TAG}{slot_n_ai} не активен. "
+                f"Используй просто «@{AI_TRIGGER_TAG} <вопрос>» для нового чата."
             )
             return
         ai_touch_slot(slot_n_ai)
@@ -1381,7 +1394,7 @@ async def _handle_ai(query: str, *, slot_n_ai: Optional[int]) -> None:
     except Exception as exc:
         log.exception("AI request failed")
         await send_dm_to_pocket_async(
-            f"@ai{slot} ошибка: {type(exc).__name__}. Проверь LM Studio."
+            f"@{AI_TRIGGER_TAG}{slot} ошибка: {type(exc).__name__}. Проверь LM Studio."
         )
         return
 
@@ -1390,7 +1403,7 @@ async def _handle_ai(query: str, *, slot_n_ai: Optional[int]) -> None:
 
     # Шлём обратно в pocket. С префиксом @aiN — в стиле наших обычных слотов.
     # Длинный ответ режется на чанки тем же _chunk_text как в handle_text.
-    full = f"@ai{slot} {answer}"
+    full = f"@{AI_TRIGGER_TAG}{slot} {answer}"
     if len(full) <= MAX_TEXT_LENGTH:
         await send_dm_to_pocket_async(full)
         return
@@ -1398,7 +1411,7 @@ async def _handle_ai(query: str, *, slot_n_ai: Optional[int]) -> None:
     chunk_room = max(40, MAX_TEXT_LENGTH - 25)
     parts = _chunk_text(answer, chunk_room)
     for i, part in enumerate(parts):
-        prefix = f"@ai{slot} {i + 1}/{len(parts)}"
+        prefix = f"@{AI_TRIGGER_TAG}{slot} {i + 1}/{len(parts)}"
         out = f"{prefix} {part}"
         try:
             await send_dm_to_pocket_async(out)

@@ -93,11 +93,15 @@ SETTINGS_SECTIONS = [
     ("bot",     "Бот · Telegram",     "bot"),
     ("pocket",  "Pocket-нода",        "radio"),
     ("device",  "Устройство",         "usb"),
+    ("mesh",    "Mesh · LoRa",        "radio"),
     ("limits",  "Лимиты",             "sliders"),
+    ("ai",      "AI-помощник",        "wand"),
     ("gps",     "GPS β",              "gps"),
     ("sos",     "SOS",                "alert"),
     ("cats",    "Категории",          "cat"),
     ("wl",      "Whitelist",          "shield"),
+    ("logs",    "Логи",               "list"),
+    ("ui",      "Интерфейс",          "settings"),
 ]
 
 # Catalog of supported hardware models — see relay/devices/__init__.py
@@ -157,11 +161,15 @@ class SettingsDialog(QDialog):
         self._sec_widgets["bot"] = self._build_bot()
         self._sec_widgets["pocket"] = self._build_pocket()
         self._sec_widgets["device"] = self._build_device()
+        self._sec_widgets["mesh"] = self._build_mesh()
         self._sec_widgets["limits"] = self._build_limits()
+        self._sec_widgets["ai"] = self._build_ai()
         self._sec_widgets["gps"] = self._build_gps()
         self._sec_widgets["sos"] = self._build_sos()
         self._sec_widgets["cats"] = self._build_cats()
         self._sec_widgets["wl"] = self._build_whitelist()
+        self._sec_widgets["logs"] = self._build_logs()
+        self._sec_widgets["ui"] = self._build_interface()
         for sid, _l, _i in SETTINGS_SECTIONS:
             self.stack.addWidget(self._sec_widgets[sid])
 
@@ -600,6 +608,290 @@ class SettingsDialog(QDialog):
         ))
         return self._section_wrap(box)
 
+    # ─── Mesh / LoRa ───────────────────────────────────────────────────
+    def _build_mesh(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setSpacing(12)
+        v.addWidget(_heading("Mesh · LoRa",
+                             "Параметры передачи по эфиру"))
+
+        gb1 = QGroupBox("HOP LIMIT")
+        f1 = QFormLayout(gb1)
+        self.sp_hop_limit = self._spin(1, 7)
+        f1.addRow("HOP_LIMIT:", self.sp_hop_limit)
+        f1.addRow("", _hint(
+            "Сколько хопов через ретрансляторы разрешено для исходящего DM. "
+            "1 = только прямая видимость (быстрее, без ретрансляций — экономия "
+            "5-15 секунд на пакет). 3 — стандарт Meshtastic, нужен если pocket "
+            "может оказаться за углом и ловит через ноды-ретрансляторы."
+        ))
+        v.addWidget(gb1)
+
+        gb2 = QGroupBox("РЕЖИМ ДОСТАВКИ")
+        v2 = QVBoxLayout(gb2)
+        self.cb_delivery_reliable = QRadioButton(
+            "Reliable — wantAck, ретраи, статусы доставки (по умолчанию)"
+        )
+        self.cb_delivery_fast = QRadioButton(
+            "Fast — fire-and-forget без ACK, мгновенная отправка"
+        )
+        self.cb_delivery_reliable.toggled.connect(self._mark_touched)
+        self.cb_delivery_fast.toggled.connect(self._mark_touched)
+        v2.addWidget(self.cb_delivery_reliable)
+        v2.addWidget(self.cb_delivery_fast)
+        v2.addWidget(_hint(
+            "Reliable — ждём ACK от pocket-ноды (~1-3 с), при потере "
+            "связи кладём в retry-очередь. Fast — никаких ACK и retry, "
+            "пакет улетел в эфир и забыли. Подходит для срочных коротких "
+            "сообщений когда «лишь бы быстрее, а не наверняка»."
+        ))
+        v.addWidget(gb2)
+
+        return self._section_wrap(box)
+
+    # ─── Logs ──────────────────────────────────────────────────────────
+    def _build_logs(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setSpacing(12)
+        v.addWidget(_heading("Логи",
+                             "Файл relay.log с ротацией"))
+
+        gb = QGroupBox("ФАЙЛ ЛОГОВ")
+        f = QFormLayout(gb)
+        f.setVerticalSpacing(8)
+
+        self.cb_log_enabled = QCheckBox("Писать лог в файл relay.log")
+        self.cb_log_enabled.toggled.connect(self._mark_touched)
+        f.addRow("", self.cb_log_enabled)
+
+        self.sp_log_max_mb = self._spin(1, 100)
+        f.addRow("Размер до ротации, МБ:", self.sp_log_max_mb)
+
+        self.sp_log_keep = self._spin(1, 50)
+        f.addRow("Хранить старых файлов:", self.sp_log_keep)
+
+        f.addRow("", _hint(
+            "Файл relay.log пишется рядом с приложением. При достижении "
+            "указанного размера переименуется в .1 / .2 / ... При отключении "
+            "лог идёт только в stdout (его подхватывает GUI и journalctl). "
+            "5 файлов × 5 МБ = ~25 МБ истории на диске."
+        ))
+        v.addWidget(gb)
+
+        return self._section_wrap(box)
+
+    # ─── AI helper ─────────────────────────────────────────────────────
+    def _build_ai(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setSpacing(12)
+        v.addWidget(_heading("AI-помощник",
+                             "Локальная LLM через LM Studio / Ollama"))
+
+        # ── Master switch + trigger tag ──
+        gb_main = QGroupBox("ОСНОВНОЕ")
+        f_main = QFormLayout(gb_main)
+        f_main.setVerticalSpacing(8)
+        self.cb_ai_enabled = QCheckBox("Включить AI-помощника")
+        self.cb_ai_enabled.toggled.connect(self._mark_touched)
+        f_main.addRow("", self.cb_ai_enabled)
+
+        self.ed_ai_trigger = QLineEdit()
+        self.ed_ai_trigger.setMaxLength(8)
+        self.ed_ai_trigger.setPlaceholderText("ai")
+        self.ed_ai_trigger.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"[a-z]{1,8}"))
+        )
+        self.ed_ai_trigger.textChanged.connect(self._mark_touched)
+        f_main.addRow("Тег команды (@<тег>):", self.ed_ai_trigger)
+        f_main.addRow("", _hint(
+            "С pocket-ноды пишешь «@<тег> <вопрос>» — приходит ответ. "
+            "Продолжение диалога — «@<тег>N <вопрос>». По умолчанию «ai», "
+            "можно сменить на «gpt», «llm». Только латиница a-z."
+        ))
+        v.addWidget(gb_main)
+
+        # ── Endpoint ──
+        gb_ep = QGroupBox("ENDPOINT")
+        f_ep = QFormLayout(gb_ep)
+        f_ep.setVerticalSpacing(8)
+        self.ed_ai_url = QLineEdit()
+        self.ed_ai_url.setPlaceholderText("http://localhost:1234/v1")
+        self.ed_ai_url.textChanged.connect(self._mark_touched)
+        self.ed_ai_url.textChanged.connect(self._on_ai_url_changed)
+        f_ep.addRow("Base URL:", self.ed_ai_url)
+        f_ep.addRow("", _hint(
+            "OpenAI-совместимый endpoint. Дефолт — LM Studio на 1234. "
+            "Для Ollama: http://localhost:11434/v1. Для OpenAI cloud: "
+            "https://api.openai.com/v1 (но тогда переписка уйдёт к ним)."
+        ))
+
+        self.ed_ai_key = QLineEdit()
+        self.ed_ai_key.setPlaceholderText("lm-studio")
+        self.ed_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.ed_ai_key.textChanged.connect(self._mark_touched)
+        f_ep.addRow("API Key:", self.ed_ai_key)
+        f_ep.addRow("", _hint(
+            "LM Studio принимает любой непустой ключ. Для облачных "
+            "провайдеров — реальный API key."
+        ))
+        v.addWidget(gb_ep)
+
+        # ── Model selection ──
+        gb_model = QGroupBox("МОДЕЛЬ")
+        f_model = QFormLayout(gb_model)
+        f_model.setVerticalSpacing(8)
+        model_row = QHBoxLayout()
+        self.cb_ai_model = QComboBox()
+        self.cb_ai_model.setEditable(True)
+        self.cb_ai_model.lineEdit().textEdited.connect(self._mark_touched)
+        model_row.addWidget(self.cb_ai_model, 1)
+        self.btn_ai_models_refresh = QPushButton("⟳")
+        self.btn_ai_models_refresh.setFixedWidth(40)
+        self.btn_ai_models_refresh.setToolTip("Загрузить список моделей с endpoint'а")
+        self.btn_ai_models_refresh.clicked.connect(self._refresh_ai_models)
+        model_row.addWidget(self.btn_ai_models_refresh)
+        model_w = QWidget()
+        model_w.setLayout(model_row)
+        f_model.addRow("Модель:", model_w)
+        f_model.addRow("", _hint(
+            "Жми ⟳ чтобы получить список моделей с endpoint'а. В LM Studio "
+            "модели появляются здесь после загрузки во вкладке Models."
+        ))
+
+        # ── Test connection ──
+        test_row = QHBoxLayout()
+        test_row.addStretch(1)
+        self.btn_ai_test = QPushButton("Проверить подключение")
+        self.btn_ai_test.clicked.connect(self._test_ai_connection)
+        test_row.addWidget(self.btn_ai_test)
+        self.lbl_ai_status = QLabel("")
+        self.lbl_ai_status.setStyleSheet(
+            f"color: {PALETTE['t3']}; font-family: 'Consolas', monospace; font-size: 11px;"
+        )
+        test_row.addWidget(self.lbl_ai_status, 1)
+        test_w = QWidget()
+        test_w.setLayout(test_row)
+        f_model.addRow("", test_w)
+        v.addWidget(gb_model)
+
+        # ── System prompt ──
+        gb_prompt = QGroupBox("СИСТЕМНЫЙ ПРОМПТ")
+        v_prompt = QVBoxLayout(gb_prompt)
+        self.ed_ai_prompt = QPlainTextEdit()
+        self.ed_ai_prompt.setPlaceholderText(
+            "Отвечай коротко и ясно. Максимум 2-3 предложения."
+        )
+        self.ed_ai_prompt.setMaximumHeight(90)
+        self.ed_ai_prompt.textChanged.connect(self._mark_touched)
+        v_prompt.addWidget(self.ed_ai_prompt)
+        v_prompt.addWidget(_hint(
+            "Задаёт тон ответов. Для LoRa-передачи важна краткость — "
+            "длинные ответы режутся на чанки [1/N]…[N/N]."
+        ))
+        v.addWidget(gb_prompt)
+
+        # ── Tuning ──
+        gb_tune = QGroupBox("НАСТРОЙКА")
+        f_tune = QFormLayout(gb_tune)
+        f_tune.setVerticalSpacing(8)
+        self.sp_ai_timeout = self._spin(5, 300)
+        f_tune.addRow("Таймаут запроса, сек:", self.sp_ai_timeout)
+        self.sp_ai_history = self._spin(0, 100)
+        f_tune.addRow("Сообщений в контексте:", self.sp_ai_history)
+        self.sp_ai_ttl = self._spin(1, 720)
+        f_tune.addRow("TTL диалога, ч:", self.sp_ai_ttl)
+        f_tune.addRow("", _hint(
+            "Контекст — сколько последних пар user/assistant подаётся в "
+            "LLM. Больше — точнее ответы, дольше обработка. "
+            "TTL — после скольких часов неактивности диалог удаляется и "
+            "@<тег>N освобождается."
+        ))
+        v.addWidget(gb_tune)
+
+        return self._section_wrap(box)
+
+    def _on_ai_url_changed(self, _text: str) -> None:
+        """Сбрасываем статус когда URL поменялся — старая проверка неактуальна."""
+        if hasattr(self, "lbl_ai_status"):
+            self.lbl_ai_status.setText("")
+
+    def _refresh_ai_models(self) -> None:
+        """GET ${base_url}/models, заполняем dropdown списком id."""
+        url = self.ed_ai_url.text().strip() or "http://localhost:1234/v1"
+        api_key = self.ed_ai_key.text() or "lm-studio"
+        try:
+            import ai_helper
+            models = ai_helper.list_models(url, api_key, timeout=5)
+        except Exception as exc:
+            self.lbl_ai_status.setText(f"⚠ {type(exc).__name__}: {exc}")
+            self.lbl_ai_status.setStyleSheet(
+                f"color: {PALETTE.get('warn', '#f0b541')}; font-family: 'Consolas', monospace; font-size: 11px;"
+            )
+            return
+        current = self.cb_ai_model.currentText()
+        self.cb_ai_model.clear()
+        for m in models:
+            self.cb_ai_model.addItem(m)
+        # Восстанавливаем выбранное если оно осталось в списке
+        if current in models:
+            self.cb_ai_model.setCurrentText(current)
+        elif current:
+            # Кастомный — оставляем в editable-поле как был
+            self.cb_ai_model.setEditText(current)
+        self.lbl_ai_status.setText(f"✓ {len(models)} моделей доступно")
+        self.lbl_ai_status.setStyleSheet(
+            f"color: {PALETTE.get('mesh', '#67ea94')}; font-family: 'Consolas', monospace; font-size: 11px;"
+        )
+
+    def _test_ai_connection(self) -> None:
+        """Кнопка «Проверить подключение» — то же что refresh, но без перезаписи дропдауна."""
+        url = self.ed_ai_url.text().strip() or "http://localhost:1234/v1"
+        api_key = self.ed_ai_key.text() or "lm-studio"
+        try:
+            import ai_helper
+            models = ai_helper.list_models(url, api_key, timeout=5)
+        except Exception as exc:
+            self.lbl_ai_status.setText(f"⚠ {type(exc).__name__}: {exc}")
+            self.lbl_ai_status.setStyleSheet(
+                f"color: {PALETTE.get('warn', '#f0b541')}; font-family: 'Consolas', monospace; font-size: 11px;"
+            )
+            return
+        self.lbl_ai_status.setText(
+            f"✓ Подключено · {len(models)} моделей: " +
+            ", ".join(models[:3]) + ("…" if len(models) > 3 else "")
+        )
+        self.lbl_ai_status.setStyleSheet(
+            f"color: {PALETTE.get('mesh', '#67ea94')}; font-family: 'Consolas', monospace; font-size: 11px;"
+        )
+
+    # ─── Interface (language) ──────────────────────────────────────────
+    def _build_interface(self) -> QWidget:
+        box = QWidget()
+        v = QVBoxLayout(box)
+        v.setSpacing(12)
+        v.addWidget(_heading("Интерфейс",
+                             "Язык приложения и прочие визуальные настройки"))
+
+        gb = QGroupBox("ЯЗЫК")
+        v_lang = QVBoxLayout(gb)
+        self.rb_lang_ru = QRadioButton("Русский")
+        self.rb_lang_en = QRadioButton("English")
+        self.rb_lang_ru.toggled.connect(self._mark_touched)
+        self.rb_lang_en.toggled.connect(self._mark_touched)
+        v_lang.addWidget(self.rb_lang_ru)
+        v_lang.addWidget(self.rb_lang_en)
+        v_lang.addWidget(_hint(
+            "Применяется частично на лету — system tray, заголовки диалогов, "
+            "wizard. Для полного применения некоторые элементы основного окна "
+            "обновятся после перезапуска."
+        ))
+        v.addWidget(gb)
+
+        return self._section_wrap(box)
+
     def _spin(self, lo: int, hi: int) -> QSpinBox:
         s = QSpinBox()
         s.setRange(lo, hi)
@@ -639,6 +931,36 @@ class SettingsDialog(QDialog):
         self.sp_pocket_stale.setValue(int(s.get("pocket_stale_min") or 60))
         self.sp_retry_init.setValue(int(s.get("retry_initial_delay_min") or 2))
         self.sp_retry_max.setValue(int(s.get("retry_max_interval_min") or 15))
+
+        # Mesh
+        self.sp_hop_limit.setValue(int(s.get("mesh_hop_limit") or 1))
+        delivery = (s.get("mesh_delivery_mode") or "reliable").lower()
+        self.cb_delivery_fast.setChecked(delivery == "fast")
+        self.cb_delivery_reliable.setChecked(delivery != "fast")
+
+        # Logs
+        self.cb_log_enabled.setChecked(bool(s.get("log_file_enabled", True)))
+        self.sp_log_max_mb.setValue(int(s.get("log_file_max_mb") or 5))
+        self.sp_log_keep.setValue(int(s.get("log_file_keep") or 5))
+
+        # AI
+        self.cb_ai_enabled.setChecked(bool(s.get("ai_enabled", False)))
+        self.ed_ai_trigger.setText(s.get("ai_trigger_tag") or "ai")
+        self.ed_ai_url.setText(s.get("ai_base_url") or "http://localhost:1234/v1")
+        self.ed_ai_key.setText(s.get("ai_api_key") or "lm-studio")
+        ai_model = s.get("ai_model") or ""
+        if ai_model:
+            self.cb_ai_model.setEditText(ai_model)
+        self.ed_ai_prompt.setPlainText(s.get("ai_system_prompt") or "")
+        self.sp_ai_timeout.setValue(int(s.get("ai_timeout_sec") or 30))
+        self.sp_ai_history.setValue(int(s.get("ai_max_history") or 10))
+        self.sp_ai_ttl.setValue(int(s.get("ai_ttl_hours") or 168))
+
+        # Interface — language
+        lang = s.get("gui_lang") or "ru"
+        self.rb_lang_ru.setChecked(lang != "en")
+        self.rb_lang_en.setChecked(lang == "en")
+
         self._touched = False
         self._update_status()
 
@@ -672,6 +994,27 @@ class SettingsDialog(QDialog):
             "sos_include_coords":     self.cb_sos_coords.isChecked(),
             "retry_initial_delay_min": self.sp_retry_init.value(),
             "retry_max_interval_min": self.sp_retry_max.value(),
+            # Mesh
+            "mesh_hop_limit":         self.sp_hop_limit.value(),
+            "mesh_delivery_mode":     ("fast" if self.cb_delivery_fast.isChecked()
+                                       else "reliable"),
+            # Logs
+            "log_file_enabled":       self.cb_log_enabled.isChecked(),
+            "log_file_max_mb":        self.sp_log_max_mb.value(),
+            "log_file_keep":          self.sp_log_keep.value(),
+            # AI
+            "ai_enabled":             self.cb_ai_enabled.isChecked(),
+            "ai_trigger_tag":         (self.ed_ai_trigger.text().strip().lower() or "ai"),
+            "ai_base_url":            self.ed_ai_url.text().strip()
+                                      or "http://localhost:1234/v1",
+            "ai_api_key":             self.ed_ai_key.text() or "lm-studio",
+            "ai_model":               self.cb_ai_model.currentText().strip(),
+            "ai_system_prompt":       self.ed_ai_prompt.toPlainText().strip(),
+            "ai_timeout_sec":         self.sp_ai_timeout.value(),
+            "ai_max_history":         self.sp_ai_history.value(),
+            "ai_ttl_hours":           self.sp_ai_ttl.value(),
+            # Interface
+            "gui_lang":               ("en" if self.rb_lang_en.isChecked() else "ru"),
         }
 
     def _save(self) -> None:
@@ -683,12 +1026,21 @@ class SettingsDialog(QDialog):
                 "\n".join("• " + e for e in errs),
             )
             return
+        old_lang = self._data.get("gui_lang", "ru")
         try:
             settings_mod.save(data)
         except OSError as e:
             QMessageBox.critical(self, "Ошибка записи", f"Не удалось:\n{e}")
             return
         self._touched = False
+        # Language change → notify user (full apply requires app restart)
+        new_lang = data.get("gui_lang", "ru")
+        if new_lang != old_lang:
+            QMessageBox.information(
+                self,
+                _t("settings.lang_changed.title", new_lang),
+                _t("settings.lang_changed.text", new_lang),
+            )
         QMessageBox.information(
             self, "Сохранено",
             "Настройки сохранены в .env.\n"

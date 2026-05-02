@@ -124,10 +124,14 @@ DEFAULTS: dict[str, Any] = {
     "log_file_keep":    5,    # сколько бэкапов хранить (relay.log.1 .. .5)
 
     # --- AI helper (locally via LM Studio / Ollama / любой OpenAI-compatible) ---
-    # Использование: с pocket-ноды напиши «@ai <вопрос>» — придёт ответ
-    # на новом slot'е (@ai1, @ai2, ...). Продолжение диалога — «@aiN <текст>»,
-    # бот подтянет историю чата для контекста.
+    # Использование: с pocket-ноды напиши «@<TRIGGER> <вопрос>» — придёт ответ
+    # на новом slot'е (@<TRIGGER>1, @<TRIGGER>2, ...). Продолжение диалога —
+    # «@<TRIGGER>N <текст>», бот подтянет историю чата для контекста.
+    # TRIGGER по умолчанию «ai», можно сменить (например на «gpt»).
     "ai_enabled":        False,
+    # Тег команды на pocket-ноде. Меняется только в latin-буквах (a-z) —
+    # иначе регексп для @<tag>N не сработает. Минимум 1 символ.
+    "ai_trigger_tag":    "ai",
     # OpenAI-compatible base URL. LM Studio на дефолтном порту слушает 1234.
     "ai_base_url":       "http://localhost:1234/v1",
     # API key. LM Studio принимает любой непустой; для облачных провайдеров
@@ -164,8 +168,9 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Delivery / retry", ["retry_initial_delay_min", "retry_max_interval_min"]),
     ("Logging", ["log_file_enabled", "log_file_max_mb", "log_file_keep"]),
     ("AI helper (LM Studio / Ollama / OpenAI-compatible)", [
-        "ai_enabled", "ai_base_url", "ai_api_key", "ai_model",
-        "ai_system_prompt", "ai_timeout_sec", "ai_max_history", "ai_ttl_hours",
+        "ai_enabled", "ai_trigger_tag", "ai_base_url", "ai_api_key",
+        "ai_model", "ai_system_prompt",
+        "ai_timeout_sec", "ai_max_history", "ai_ttl_hours",
     ]),
 ]
 

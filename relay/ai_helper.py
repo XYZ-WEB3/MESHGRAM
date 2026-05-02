@@ -103,3 +103,36 @@ def is_available() -> bool:
 def init_error() -> Optional[str]:
     """Последняя ошибка инициализации (для отладочного сообщения юзеру)."""
     return _init_error
+
+
+def list_models(base_url: str, api_key: str = "lm-studio",
+                timeout: int = 5) -> list[str]:
+    """Sync HTTP GET на ${base_url}/models. Возвращает список model id'шников.
+
+    Используется в Settings dialog для авто-заполнения дропдауна моделей.
+    Не использует AsyncOpenAI чтоб не блокировать GUI и не требовать
+    asyncio. Простой requests.get.
+
+    Бросает исключение при сетевой ошибке / non-200 / битом JSON —
+    вызывающий код покажет это юзеру в виде «⚠ <тип>: <текст>».
+    """
+    import requests   # уже в зависимостях через meshtastic-python
+
+    url = base_url.rstrip("/") + "/models"
+    headers = {}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    resp = requests.get(url, headers=headers, timeout=timeout)
+    resp.raise_for_status()
+    payload = resp.json()
+    # OpenAI-совместимый формат: {"data": [{"id": "...", ...}, ...]}
+    items = payload.get("data") or payload.get("models") or []
+    out: list[str] = []
+    for item in items:
+        if isinstance(item, dict):
+            mid = item.get("id") or item.get("name")
+            if mid:
+                out.append(str(mid))
+        elif isinstance(item, str):
+            out.append(item)
+    return out
