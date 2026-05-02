@@ -4,6 +4,68 @@
 
 ---
 
+## v0.7.2 — фиксы wizard'а и архитектуры frozen-сборки
+
+В v0.7.1 готовый `.exe` падал в трёх местах. Этот патч их закрывает.
+
+### BUG #1: wizard крашил на «Назад» / «Готово»
+
+`OnboardingDialog._render` пересоздавал страницы через `deleteLater()`, но Python-атрибуты `self.ed_token`, `self.ed_owner`, `self.ed_pocket` оставались как dangling references на уже уничтоженные C++ Qt-объекты. При следующем `_render` проверка `hasattr(self, "ed_token")` возвращала `True`, но `addWidget(self.ed_token)` падал с `RuntimeError: wrapped C/C++ object has been deleted`.
+
+**Фикс**: переписал диалог на `QStackedWidget`. Все 4 страницы создаются один раз в `_build_ui` и переключаются через `setCurrentIndex` — никаких уничтожений-пересозданий, никакого риска dangling-references.
+
+### BUG #2: настройки сохранялись во временную папку и терялись
+
+В onefile-сборке PyInstaller при запуске распаковывает bundle в `%TEMP%\_MEIxxxxx\` и `__file__` указывает туда. `settings.py` вычислял путь к `.env` как `Path(__file__).with_name('.env')` — то есть пытался писать в распакованную временную папку. На каждом запуске PyInstaller создаёт **новую** временную папку, поэтому даже если запись проходила, при следующем запуске настройки терялись.
+
+**Фикс**: новый модуль `relay/paths.py` определяет два разных понятия пути:
+- `APP_DATA_DIR` — пользовательские данные (`.env`, `relay.db`, `relay.log`). В frozen — **рядом с `.exe`** (`Path(sys.executable).parent`). В source — рядом с `relay.py`.
+- `RESOURCE_DIR` — read-only ресурсы (иконки, SVG моделей нод). В frozen — `sys._MEIPASS`. В source — рядом с `relay.py`.
+
+Юзер теперь может скопировать папку с `Meshgram.exe` и `.env` на другой ПК — всё переедет вместе. Настройки переживают перезапуск.
+
+### BUG #3: кнопка «Старт» в `.exe` не запускала релей
+
+`gui.py` стартовал релей через `QProcess.start(sys.executable, [str(RELAY_SCRIPT)])`. В frozen-сборке `sys.executable` — это `Meshgram.exe`, а не `python.exe`. Передача ему пути к `relay.py` ничего не запускала.
+
+**Фикс**: единый бинарник, два режима. В `gui.py:main()` проверяется флаг `--relay`:
+
+```python
+if "--relay" in sys.argv:
+    sys.argv.remove("--relay")
+    import relay as relay_module
+    relay_module.main()
+    return
+```
+
+Когда GUI хочет запустить релей, он вызывает `sys.executable --relay --port COMx`. Это запускает копию `Meshgram.exe`, которая благодаря флагу превращается в релей-процесс.
+
+### Локализация GUI (RU + EN)
+
+Новый модуль `relay/i18n_gui.py` со словарём строк (~50 ключей покрывают wizard, system tray, single-instance MessageBox, кнопки выхода). Расширяемая структура: `t(key, lang)` падает на RU при отсутствии перевода.
+
+Wizard теперь начинается с **выбора языка** — это шаг 0 из 4. Дальше идут токен / Telegram ID / pocket node ID, как раньше. Язык сохраняется в `settings.gui_lang` и применяется на лету (`@lang en` меняет UI без перезапуска).
+
+Что **переведено** в этом патче:
+- Полный wizard первого запуска (4 шага + кнопки + warnings)
+- System tray меню (Open / Start / Stop / Quit)
+- MessageBox при второй копии («Meshgram уже запущен»)
+- Confirm-on-quit диалог
+- Уведомление «свёрнут в трей»
+
+Что **пока на русском** (отдельной задачей в roadmap):
+- SettingsDialog (~30 строк, объёмно)
+- AboutDialog, UsersDialog, SlotsDialog
+- Тексты в релей-стороне (`relay.py` user-facing) — через `i18n_gui` придётся, но 200+ строк
+
+### Прочее
+
+- Тесты остались зелёными (67 passed) после рефакторинга
+- `Meshgram.spec` подключает новые модули (`paths.py`, `i18n_gui.py`)
+- `relay/Meshgram.exe` — пересобран, ~74 МБ
+
+---
+
 ## v0.7.1 — тесты, упакованный .exe, tray и single-instance
 
 ### Тесты (pytest)

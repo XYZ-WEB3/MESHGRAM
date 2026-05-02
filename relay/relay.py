@@ -83,6 +83,7 @@ POLLING_STABLE_RESET_SEC:    int = 60
 import sys as _sys
 _sys.path.insert(0, str(Path(__file__).parent))
 import ai_helper
+import paths as _paths
 import settings as _settings_mod
 
 _S = _settings_mod.load()
@@ -145,12 +146,14 @@ AI_MAX_HISTORY: int      = int(_S.get("ai_max_history") or 10)
 AI_TTL_HOURS: int        = int(_S.get("ai_ttl_hours") or 168)
 
 # SQLite file next to this script.
-DB_PATH: Path = Path(__file__).with_name("relay.db")
+# DB лежит рядом с пользовательским .env. В frozen .exe — рядом с .exe,
+# в source — рядом с relay.py. См. paths.py для обоснования.
+DB_PATH: Path = _paths.APP_DATA_DIR / "relay.db"
 
 # Лог-файл рядом со скриптом. Ротация по размеру: при достижении
 # LOG_FILE_MAX_MB файл переименовывается в .1 (старый .1 → .2 и т.д.),
 # хранится LOG_FILE_KEEP бэкапов. Настраивается в .env.
-LOG_FILE_PATH:    Path = Path(__file__).with_name("relay.log")
+LOG_FILE_PATH:    Path = _paths.APP_DATA_DIR / "relay.log"
 LOG_FILE_ENABLED: bool = bool(_S["log_file_enabled"])
 LOG_FILE_MAX_MB:  int  = int(_S["log_file_max_mb"])
 LOG_FILE_KEEP:    int  = int(_S["log_file_keep"])

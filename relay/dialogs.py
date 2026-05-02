@@ -39,6 +39,7 @@ from PyQt6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QRadioButton,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -48,7 +49,9 @@ from PyQt6.QtWidgets import (
 )
 
 import db
+import i18n_gui
 import settings as settings_mod
+from i18n_gui import t as _t
 from icons import make_icon
 from theme import PALETTE
 from widgets import Badge, GlowDot, ToolBtn, ToolSep
@@ -289,7 +292,7 @@ class SettingsDialog(QDialog):
         f.setVerticalSpacing(8)
 
         self.ed_pocket = QLineEdit()
-        self.ed_pocket.setPlaceholderText("!a3f9c812")
+        self.ed_pocket.setPlaceholderText("!1ba6795c")
         self.ed_pocket.setValidator(
             QRegularExpressionValidator(QRegularExpression(r"!?[0-9a-fA-F]{0,8}"))
         )
@@ -1165,22 +1168,33 @@ class SlotsDialog(QDialog):
 # OnboardingDialog — first-run 3-step wizard
 # ===========================================================================
 class OnboardingDialog(QDialog):
-    """Three steps: bot token → owner ID → pocket node ID."""
+    """4-step first-run wizard: language → token → owner ID → pocket node ID.
+
+    Implementation note: использует QStackedWidget вместо удаления-пересоздания
+    виджетов через deleteLater. Прежняя реализация падала на кнопке «Назад»
+    из-за dangling Python-ссылок на уничтоженные C++ Qt-объекты.
+    """
+
+    STEP_LANG, STEP_TOKEN, STEP_OWNER, STEP_POCKET = 0, 1, 2, 3
+    TOTAL_STEPS = 4
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Первый запуск — настройка")
-        self.resize(560, 460)
-        self._step = 0
+        # Подгружаем текущий выбранный язык. На первом запуске — RU,
+        # после клика на radio-кнопке language step _render обновит UI на лету.
+        self._lang = settings_mod.load().get("gui_lang", "ru")
+        self.setWindowTitle(_t("wizard.title", self._lang))
+        self.resize(580, 480)
+        self._step = self.STEP_LANG
         self._build_ui()
-        self._render()
+        self._render_chrome()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # Header
+        # ── Header ────────────────────────────────────────────────────
         hdr = QFrame()
         hdr.setStyleSheet(
             f"QFrame {{ background: {PALETTE['bg2']}; "
@@ -1191,11 +1205,11 @@ class OnboardingDialog(QDialog):
         ic = QLabel()
         ic.setPixmap(make_icon("wand", color=PALETTE["accent"], size=20).pixmap(20, 20))
         hl.addWidget(ic)
-        title = QLabel("Добро пожаловать в Meshgram Relay")
-        title.setStyleSheet(
+        self._title_lbl = QLabel()
+        self._title_lbl.setStyleSheet(
             f"color: {PALETTE['t1']}; font-size: 14px; font-weight: 600;"
         )
-        hl.addWidget(title)
+        hl.addWidget(self._title_lbl)
         hl.addStretch(1)
         self._step_lbl = QLabel("")
         self._step_lbl.setStyleSheet(
@@ -1204,14 +1218,15 @@ class OnboardingDialog(QDialog):
         hl.addWidget(self._step_lbl)
         root.addWidget(hdr)
 
-        # Body container
-        self.body = QFrame()
-        self.body_lay = QVBoxLayout(self.body)
-        self.body_lay.setContentsMargins(28, 24, 28, 24)
-        self.body_lay.setSpacing(14)
-        root.addWidget(self.body, 1)
+        # ── Body: QStackedWidget со страницами на все шаги ────────────
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_page_lang())     # index 0
+        self._stack.addWidget(self._build_page_token())    # index 1
+        self._stack.addWidget(self._build_page_owner())    # index 2
+        self._stack.addWidget(self._build_page_pocket())   # index 3
+        root.addWidget(self._stack, 1)
 
-        # Footer
+        # ── Footer ────────────────────────────────────────────────────
         foot = QFrame()
         foot.setStyleSheet(
             f"QFrame {{ background: {PALETTE['bg2']}; "
@@ -1219,135 +1234,203 @@ class OnboardingDialog(QDialog):
         )
         fl = QHBoxLayout(foot)
         fl.setContentsMargins(14, 10, 14, 10)
-        self.bskip = QPushButton("Сделаю позже")
+        self.bskip = QPushButton()
         self.bskip.setProperty("role", "ghost")
         self.bskip.clicked.connect(self.reject)
         fl.addWidget(self.bskip)
         fl.addStretch(1)
-        self.bback = ToolBtn("chevLeft", "Назад")
+        self.bback = ToolBtn("chevLeft", "")
         self.bback.setProperty("role", "ghost")
         self.bback.clicked.connect(self._back)
         fl.addWidget(self.bback)
-        self.bnext = ToolBtn("chevRight", "Дальше")
+        self.bnext = ToolBtn("chevRight", "")
         self.bnext.setProperty("role", "primary")
         self.bnext.clicked.connect(self._next)
         fl.addWidget(self.bnext)
         root.addWidget(foot)
 
-    def _render(self) -> None:
-        # clear
-        while self.body_lay.count():
-            it = self.body_lay.takeAt(0)
-            w = it.widget()
-            if w:
-                w.deleteLater()
+    # ── Page builders (создаются один раз) ────────────────────────────
 
-        self._step_lbl.setText(f"Шаг {self._step + 1} из 3")
-        if self._step == 0:
-            self._render_step1()
-        elif self._step == 1:
-            self._render_step2()
-        else:
-            self._render_step3()
+    def _build_page_lang(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+        self._lang_heading = _heading("", "")
+        lay.addWidget(self._lang_heading)
+        self._lang_hint = _hint("")
+        lay.addWidget(self._lang_hint)
 
+        self._rb_ru = QRadioButton()
+        self._rb_en = QRadioButton()
+        self._rb_ru.setChecked(self._lang == "ru")
+        self._rb_en.setChecked(self._lang == "en")
+        self._rb_ru.toggled.connect(lambda checked: self._on_lang_changed("ru") if checked else None)
+        self._rb_en.toggled.connect(lambda checked: self._on_lang_changed("en") if checked else None)
+        lay.addWidget(self._rb_ru)
+        lay.addWidget(self._rb_en)
+        lay.addStretch(1)
+        return page
+
+    def _build_page_token(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+        self._token_heading = _heading("", "")
+        lay.addWidget(self._token_heading)
+        self._token_hint = _hint("")
+        lay.addWidget(self._token_hint)
+        self.ed_token = QLineEdit()
+        self.ed_token.setEchoMode(QLineEdit.EchoMode.Password)
+        lay.addWidget(self.ed_token)
+        lay.addStretch(1)
+        return page
+
+    def _build_page_owner(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+        self._owner_heading = _heading("", "")
+        lay.addWidget(self._owner_heading)
+        self._owner_hint = _hint("")
+        lay.addWidget(self._owner_hint)
+        self.ed_owner = QLineEdit()
+        self.ed_owner.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"\d{1,20}"))
+        )
+        lay.addWidget(self.ed_owner)
+        lay.addStretch(1)
+        return page
+
+    def _build_page_pocket(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(28, 24, 28, 24)
+        lay.setSpacing(14)
+        self._pocket_heading = _heading("", "")
+        lay.addWidget(self._pocket_heading)
+        self._pocket_hint = _hint("")
+        lay.addWidget(self._pocket_hint)
+        self.ed_pocket = QLineEdit()
+        self.ed_pocket.setPlaceholderText("!1ba6795c")
+        self.ed_pocket.setValidator(
+            QRegularExpressionValidator(QRegularExpression(r"!?[0-9a-fA-F]{0,8}"))
+        )
+        lay.addWidget(self.ed_pocket)
+        lay.addStretch(1)
+        return page
+
+    # ── Re-render texts based on _lang and _step ─────────────────────
+
+    def _render_chrome(self) -> None:
+        """Обновляет тексты заголовков/кнопок/страниц под текущий язык
+        и активную страницу. Безопасен: только setText/setEnabled/setCurrentIndex,
+        ничего не уничтожает."""
+        L = self._lang
+        self.setWindowTitle(_t("wizard.title", L))
+        self._title_lbl.setText(_t("wizard.welcome", L))
+        self._step_lbl.setText(
+            _t("wizard.step_of", L).format(n=self._step + 1, total=self.TOTAL_STEPS)
+        )
+
+        # Page-level тексты — обновляем все, чтобы переключение языка
+        # на странице 0 моментально применялось ко всем страницам.
+        self._set_heading(self._lang_heading,
+                          _t("wizard.step_lang.title", L),
+                          _t("wizard.step_lang.hint", L))
+        self._lang_hint.setText("")
+        self._rb_ru.setText(_t("wizard.step_lang.option_ru", L))
+        self._rb_en.setText(_t("wizard.step_lang.option_en", L))
+
+        self._set_heading(self._token_heading,
+                          _t("wizard.step_token.title", L),
+                          _t("wizard.step_token.lede", L))
+        self._token_hint.setText(_t("wizard.step_token.hint", L))
+
+        self._set_heading(self._owner_heading,
+                          _t("wizard.step_owner.title", L),
+                          _t("wizard.step_owner.lede", L))
+        self._owner_hint.setText(_t("wizard.step_owner.hint", L))
+
+        self._set_heading(self._pocket_heading,
+                          _t("wizard.step_pocket.title", L),
+                          _t("wizard.step_pocket.lede", L))
+        self._pocket_hint.setText(_t("wizard.step_pocket.hint", L))
+
+        # Кнопки футера
+        self.bskip.setText(_t("wizard.btn_skip", L))
+        self.bback.setText("  " + _t("wizard.btn_back", L))
+        is_last = self._step == self.STEP_POCKET
+        self.bnext.setText("  " + _t("wizard.btn_done" if is_last else "wizard.btn_next", L))
         self.bback.setEnabled(self._step > 0)
-        self.bnext.setText("  Готово" if self._step == 2 else "  Дальше")
 
-    def _render_step1(self) -> None:
-        self.body_lay.addWidget(_heading(
-            "1. Токен бота",
-            "Бот в Telegram, через который тебя будут писать чужие люди."
-        ))
-        self.body_lay.addWidget(_hint(
-            "Создай нового бота: открой @BotFather в Telegram, отправь /newbot, "
-            "следуй подсказкам. В конце получишь строку формата 'NNNNN:XXXX...'. "
-            "Скопируй её сюда."
-        ))
-        if not hasattr(self, "ed_token"):
-            self.ed_token = QLineEdit()
-            self.ed_token.setEchoMode(QLineEdit.EchoMode.Password)
-        self.body_lay.addWidget(self.ed_token)
-        self.body_lay.addStretch(1)
+        # Активная страница
+        self._stack.setCurrentIndex(self._step)
 
-    def _render_step2(self) -> None:
-        self.body_lay.addWidget(_heading(
-            "2. Твой Telegram ID",
-            "Чтобы бот узнавал тебя как админа."
-        ))
-        self.body_lay.addWidget(_hint(
-            "Открой в Telegram бота @my_id_bot и нажми /start. "
-            "Он ответит твоим numeric ID — большое число. Скопируй и вставь сюда."
-        ))
-        if not hasattr(self, "ed_owner"):
-            self.ed_owner = QLineEdit()
-            self.ed_owner.setValidator(
-                QRegularExpressionValidator(QRegularExpression(r"\d{1,20}"))
-            )
-        self.body_lay.addWidget(self.ed_owner)
-        self.body_lay.addStretch(1)
+    @staticmethod
+    def _set_heading(heading_widget: QWidget, title: str, lede: str) -> None:
+        """_heading() вернул composite-виджет (заголовок+подпись).
+        Прокладываем тексты через первые два QLabel'а внутри."""
+        labels = heading_widget.findChildren(QLabel)
+        if len(labels) >= 1:
+            labels[0].setText(title)
+        if len(labels) >= 2:
+            labels[1].setText(lede)
 
-    def _render_step3(self) -> None:
-        self.body_lay.addWidget(_heading(
-            "3. ID карманной ноды",
-            "Meshtastic-устройство, которое будешь носить с собой."
-        ))
-        self.body_lay.addWidget(_hint(
-            "Подключи карманную ноду к Meshtastic-приложению или к веб-клиенту "
-            "(client.meshtastic.org). В списке узлов её ID показан как !xxxxxxxx — "
-            "8 hex-символов с восклицательным знаком. Скопируй сюда."
-        ))
-        if not hasattr(self, "ed_pocket"):
-            self.ed_pocket = QLineEdit()
-            self.ed_pocket.setPlaceholderText("!a3f9c812")
-            self.ed_pocket.setValidator(
-                QRegularExpressionValidator(QRegularExpression(r"!?[0-9a-fA-F]{0,8}"))
-            )
-        self.body_lay.addWidget(self.ed_pocket)
-        self.body_lay.addStretch(1)
+    # ── Event handlers ────────────────────────────────────────────────
+
+    def _on_lang_changed(self, lang: str) -> None:
+        if lang in ("ru", "en") and lang != self._lang:
+            self._lang = lang
+            self._render_chrome()
 
     def _next(self) -> None:
-        if self._step == 0 and not self.ed_token.text().strip():
-            QMessageBox.warning(self, "Нужно", "Вставь токен от @BotFather.")
+        L = self._lang
+        if self._step == self.STEP_TOKEN and not self.ed_token.text().strip():
+            QMessageBox.warning(self, _t("wizard.warn_need", L), _t("wizard.warn_token", L))
             return
-        if self._step == 1:
+        if self._step == self.STEP_OWNER:
             try:
                 if int(self.ed_owner.text() or 0) <= 0:
                     raise ValueError()
             except ValueError:
-                QMessageBox.warning(self, "Нужно", "Вставь свой numeric ID от @my_id_bot.")
+                QMessageBox.warning(self, _t("wizard.warn_need", L), _t("wizard.warn_owner", L))
                 return
-        if self._step == 2:
+        if self._step == self.STEP_POCKET:
             self._finish()
             return
         self._step += 1
-        self._render()
+        self._render_chrome()
 
     def _back(self) -> None:
         if self._step > 0:
             self._step -= 1
-            self._render()
+            self._render_chrome()
 
     def _finish(self) -> None:
+        L = self._lang
         pid = self.ed_pocket.text().strip()
         if not (pid.startswith("!") and len(pid) == 9
                 and all(c in "0123456789abcdefABCDEF" for c in pid[1:])):
-            QMessageBox.warning(
-                self, "Нужно",
-                "ID карманной ноды должен быть формата !xxxxxxxx (8 hex-знаков).",
-            )
+            QMessageBox.warning(self, _t("wizard.warn_need", L),
+                                _t("wizard.warn_pocket", L))
             return
         data = settings_mod.load()
+        data["gui_lang"] = self._lang
         data["bot_token"] = self.ed_token.text().strip()
         data["owner_id"] = int(self.ed_owner.text() or 0)
         data["pocket_node_id"] = pid
         errs = settings_mod.validate(data)
         if errs:
-            QMessageBox.warning(self, "Не сохранено", "\n".join("• " + e for e in errs))
+            QMessageBox.warning(self, _t("wizard.warn_validation", L),
+                                "\n".join("• " + e for e in errs))
             return
         try:
             settings_mod.save(data)
-        except OSError as e:
-            QMessageBox.critical(self, "Ошибка записи", str(e))
+        except (OSError, PermissionError) as e:
+            QMessageBox.critical(self, _t("wizard.warn_save", L), str(e))
             return
         self.accept()
 

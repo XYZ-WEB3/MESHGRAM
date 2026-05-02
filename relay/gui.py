@@ -57,6 +57,7 @@ SCRIPT_DIR = Path(__file__).parent
 sys.path.insert(0, str(SCRIPT_DIR))
 
 import db
+import i18n_gui
 import settings as settings_mod
 from dialogs import (
     AboutDialog,
@@ -65,11 +66,30 @@ from dialogs import (
     SlotsDialog,
     UsersDialog,
 )
+from i18n_gui import t as _t
 from icons import make_icon
 from theme import PALETTE, apply_theme
 from widgets import GlowDot, LogConsole, NodePanel, StatusCell, ToolBtn, ToolSep
 
 RELAY_SCRIPT = SCRIPT_DIR / "relay.py"
+
+
+def _is_frozen() -> bool:
+    """True если запущены из PyInstaller .exe."""
+    return getattr(sys, "frozen", False)
+
+
+def _relay_command() -> tuple[str, list[str]]:
+    """Возвращает (program, args) для запуска relay-процесса.
+
+    Frozen .exe: запускаем себя же с флагом --relay (один бинарник, два режима).
+    Source: запускаем интерпретатор с relay.py.
+    """
+    if _is_frozen():
+        # sys.executable указывает на Meshgram.exe — запускаем его с --relay
+        return (sys.executable, ["--relay"])
+    # Source-mode — обычный запуск
+    return (sys.executable, [str(RELAY_SCRIPT)])
 
 
 class Relay(QMainWindow):
@@ -153,14 +173,15 @@ class Relay(QMainWindow):
         недоступен (редко на современных DE) — просто пропускаем."""
         if not QSystemTrayIcon.isSystemTrayAvailable():
             return
+        L = self._cfg.get("gui_lang", "ru")
         self._tray = QSystemTrayIcon(icon, self)
-        self._tray.setToolTip("Meshgram Relay")
+        self._tray.setToolTip(_t("tray.tooltip", L))
 
         menu = QMenu(self)
-        act_show = QAction("Открыть", self, triggered=self._tray_show)
-        act_start = QAction("Старт релея", self, triggered=self._start)
-        act_stop = QAction("Стоп релея", self, triggered=self._stop)
-        act_quit = QAction("Выйти", self, triggered=self._tray_quit)
+        act_show = QAction(_t("tray.open", L), self, triggered=self._tray_show)
+        act_start = QAction(_t("tray.start", L), self, triggered=self._start)
+        act_stop = QAction(_t("tray.stop", L), self, triggered=self._stop)
+        act_quit = QAction(_t("tray.quit", L), self, triggered=self._tray_quit)
         menu.addAction(act_show)
         menu.addSeparator()
         menu.addAction(act_start)
@@ -683,7 +704,10 @@ class Relay(QMainWindow):
         if not port:
             QMessageBox.warning(self, "Порт", "Сначала выбери COM-порт.")
             return
-        if not RELAY_SCRIPT.exists():
+        # В source-режиме проверяем что relay.py рядом. В frozen-mode
+        # relay.py запекался в bundle, проверять его наличие на диске
+        # не нужно (он внутри .exe).
+        if not _is_frozen() and not RELAY_SCRIPT.exists():
             QMessageBox.critical(self, "relay.py", "relay.py не найден.")
             return
         cfg = settings_mod.load()
@@ -701,9 +725,12 @@ class Relay(QMainWindow):
         except OSError:
             pass
 
-        self.console.append_raw(f"{self._ts()}▶ Запуск relay.py на {port}\n")
+        self.console.append_raw(f"{self._ts()}▶ Запуск relay на {port}\n")
         self.process = QProcess()
-        self.process.setWorkingDirectory(str(SCRIPT_DIR))
+        # В frozen-mode рабочая папка должна быть рядом с .exe
+        # (там лежит .env / relay.db). В source — рядом со скриптами.
+        from paths import APP_DATA_DIR
+        self.process.setWorkingDirectory(str(APP_DATA_DIR))
         env = QProcessEnvironment.systemEnvironment()
         env.insert("PYTHONIOENCODING", "utf-8")
         env.insert("PYTHONUNBUFFERED", "1")
@@ -711,7 +738,8 @@ class Relay(QMainWindow):
         self.process.readyReadStandardOutput.connect(self._on_stdout)
         self.process.readyReadStandardError.connect(self._on_stderr)
         self.process.finished.connect(self._on_finished)
-        self.process.start(sys.executable, [str(RELAY_SCRIPT), "--port", port])
+        program, base_args = _relay_command()
+        self.process.start(program, base_args + ["--port", port])
         if not self.process.waitForStarted(3000):
             self.console.append_raw(f"{self._ts()}✗ Не удалось запустить процесс\n")
             self.process = None
@@ -753,6 +781,8 @@ class Relay(QMainWindow):
         self._refresh_status()
 
     def closeEvent(self, ev) -> None:
+        L = self._cfg.get("gui_lang", "ru")
+
         # Если трей доступен и юзер закрывает крестиком — сворачиваем в трей
         # (релей продолжает работать). Полный выход — через tray-меню «Выйти».
         if (
@@ -765,8 +795,8 @@ class Relay(QMainWindow):
             # Один раз показываем уведомление что не закрылись, а свернулись.
             if not getattr(self, "_tray_notified", False):
                 self._tray.showMessage(
-                    "Meshgram свёрнут",
-                    "Релей продолжает работать в фоне. Полное закрытие — через меню в трее.",
+                    _t("tray.minimize_title", L),
+                    _t("tray.minimize_text", L),
                     QSystemTrayIcon.MessageIcon.Information,
                     4000,
                 )
@@ -775,8 +805,8 @@ class Relay(QMainWindow):
 
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             r = QMessageBox.question(
-                self, "Релей работает",
-                "Релей ещё запущен. Остановить и выйти?",
+                self, _t("quit.relay_running.title", L),
+                _t("quit.relay_running.text", L),
             )
             if r != QMessageBox.StandardButton.Yes:
                 ev.ignore()
@@ -798,6 +828,17 @@ _SINGLE_INSTANCE_KEY = "Meshgram-Relay-SingleInstance-v1"
 
 
 def main() -> None:
+    # ── Relay-mode: один и тот же бинарник может работать как GUI или
+    # как relay-процесс. Это критично для PyInstaller .exe — внутри нет
+    # отдельного python.exe, и GUI запускает себя же с --relay.
+    if "--relay" in sys.argv:
+        sys.argv.remove("--relay")
+        # Импорт relay поздний — чтобы при обычном GUI-запуске не загружать
+        # тяжёлые meshtastic/telegram модули.
+        import relay as relay_module
+        relay_module.main()
+        return
+
     app = QApplication(sys.argv)
     app.setApplicationName("Meshgram")
     app.setApplicationDisplayName("Meshgram Relay")
@@ -812,11 +853,14 @@ def main() -> None:
     if shared.attach():
         shared.detach()
     if not shared.create(1):
+        # Локализуем сообщение под язык пользователя из настроек
+        # (если уже сохранён) или по дефолту RU.
+        try:
+            _lang = settings_mod.load().get("gui_lang", "ru")
+        except Exception:
+            _lang = "ru"
         QMessageBox.information(
-            None, "Meshgram уже запущен",
-            "Meshgram Relay уже работает (см. иконку в системном трее).\n"
-            "Если это ошибка — закрой все процессы python.exe в диспетчере "
-            "задач и запусти заново.",
+            None, _t("single.title", _lang), _t("single.text", _lang),
         )
         sys.exit(0)
 

@@ -31,10 +31,13 @@ a = Analysis(
         (str(ROOT / "assets" / "icon.png"), "assets"),
         # Папка с SVG-моделями нод (50 штук, нужны для node-picker)
         (str(ROOT / "devices"), "devices"),
-        # relay.py — стартуется через QProcess из GUI, должен быть в bundle
+        # relay.py — стартуется через QProcess (sys.executable --relay)
+        # из GUI, должен быть в bundle для импорта в frozen режиме
         (str(ROOT / "relay.py"), "."),
-        # Helper-модули которые relay.py импортирует
+        # Helper-модули которые relay.py / gui.py импортируют
         (str(ROOT / "ai_helper.py"), "."),
+        (str(ROOT / "i18n_gui.py"), "."),
+        (str(ROOT / "paths.py"), "."),
         (str(ROOT / "settings.py"), "."),
         (str(ROOT / "db.py"), "."),
         (str(ROOT / "dialogs.py"), "."),

@@ -20,11 +20,34 @@ index without None-checks.
 from __future__ import annotations
 
 import copy
+import sys
 from pathlib import Path
 from typing import Any
 
-ENV_PATH: Path = Path(__file__).with_name(".env")
-EXAMPLE_PATH: Path = Path(__file__).with_name(".env.example")
+
+def _resolve_app_dir() -> Path:
+    """Папка для пользовательских данных. В frozen-сборке (.exe) — рядом
+    с .exe. В обычном запуске — рядом с этим .py файлом.
+
+    Не импортируем `paths.py` здесь чтобы settings.py не имел
+    дополнительных зависимостей и оставался самодостаточным.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
+_APP_DIR = _resolve_app_dir()
+ENV_PATH: Path = _APP_DIR / ".env"
+# .env.example — read-only template, ищем в bundle (для frozen) или
+# рядом с скриптом (для source). Записывается через write_example()
+# только в source-режиме.
+_EXAMPLE_DIR = _APP_DIR
+if getattr(sys, "frozen", False):
+    _meipass = getattr(sys, "_MEIPASS", None)
+    if _meipass:
+        _EXAMPLE_DIR = Path(_meipass)
+EXAMPLE_PATH: Path = _EXAMPLE_DIR / ".env.example"
 
 
 # ---------------------------------------------------------------------------
@@ -36,6 +59,11 @@ DEFAULTS: dict[str, Any] = {
     "owner_id":       0,
     "pocket_node_id": "",
     "last_com_port":  "",
+
+    # Язык GUI: "ru" / "en". Спрашивается на первом запуске в wizard'е.
+    # Меняется через настройки. Релей-side тексты (что уходит в LoRa) не
+    # затрагиваются — только UI на стороне пользователя.
+    "gui_lang":       "ru",
 
     # Display name for the relay's recipient, shown to public users in bot
     # replies ("📨 Передаю Михаилу…", "Михаил: ..." etc). Default is "Михаил"
@@ -122,6 +150,7 @@ DEFAULTS: dict[str, Any] = {
 # Keys grouped for nice .env formatting.
 GROUPS: list[tuple[str, list[str]]] = [
     ("Connection", ["bot_token", "owner_id", "pocket_node_id", "last_com_port",
+                    "gui_lang",
                     "display_name", "node_model", "mesh_hop_limit",
                     "mesh_delivery_mode"]),
     ("Limits", ["max_text_length", "slot_ttl_hours", "slot_sticky_hours",
