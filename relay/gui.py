@@ -818,10 +818,59 @@ class Relay(QMainWindow):
                 return
             self.process.kill()
             self.process.waitForFinished(3000)
+
+        # На Windows дочерние процессы НЕ убиваются автоматически при смерти
+        # родителя (нет PR_SET_PDEATHSIG). Если QProcess.kill() не дошёл до
+        # ребёнка (или ребёнок успел спавнить grandchild) — process tree
+        # остаётся осиротевшим и висит до перезагрузки. Чистим явно через
+        # psutil. Если psutil не установлен — fallback к taskkill /T.
+        _kill_self_tree()
+
         # Скрываем трей перед закрытием — иначе он зависнет в systray
         if self._tray is not None:
             self._tray.hide()
         ev.accept()
+
+
+def _kill_self_tree() -> None:
+    """Убить все процессы из своего дерева (children, grand-children).
+
+    Windows не убивает потомков автоматически когда родитель умирает —
+    QProcess.kill() режет одного direct ребёнка, но если ребёнок успел
+    породить ещё процессы (тот же meshtastic-python спавнит USB-watcher),
+    они зависают зомби-сиротами. У юзера в TaskManager это видно как
+    «Meshgram.exe: 2 process» после вроде-бы-полного quit.
+
+    Использует psutil (есть в зависимостях meshtastic-python). Если
+    почему-то отсутствует — fallback на `taskkill /F /T /PID`, грубый
+    но работающий путь.
+    """
+    import os
+
+    my_pid = os.getpid()
+    try:
+        import psutil  # type: ignore
+        try:
+            me = psutil.Process(my_pid)
+            children = me.children(recursive=True)
+            for child in children:
+                try:
+                    child.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            psutil.wait_procs(children, timeout=2.0)
+        except psutil.NoSuchProcess:
+            pass
+    except ImportError:
+        # fallback: taskkill /T = tree включая grandchildren
+        try:
+            import subprocess
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(my_pid)],
+                capture_output=True, timeout=5, check=False,
+            )
+        except Exception:
+            pass
 
 
 # Уникальный ключ shared-memory для single-instance проверки. Если
@@ -874,6 +923,12 @@ def main() -> None:
 
     # Держим shared memory live до выхода
     app._meshgram_shared_memory = shared    # type: ignore[attr-defined]
+
+    # Catch-all для любого exit-пути (Ctrl+Q / menu / system shutdown /
+    # exception в event loop). Гарантирует что children-процессы не остаются
+    # сиротами на Windows. Дублирует closeEvent → не страшно, kill идемпотентен.
+    app.aboutToQuit.connect(_kill_self_tree)
+
     sys.exit(app.exec())
 
 

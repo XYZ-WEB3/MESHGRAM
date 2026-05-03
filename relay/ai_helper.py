@@ -25,6 +25,34 @@ _initialized = False
 _init_error: Optional[str] = None
 
 
+def _normalize_base_url(url: str) -> str:
+    """Гарантирует что base_url содержит path-segment (/v1 по умолчанию).
+
+    LM Studio, Ollama, OpenAI ждут endpoints на `<base>/chat/completions`,
+    `<base>/models` и т.п. Если юзер впишет в GUI просто `http://127.0.0.1:1234`
+    (без `/v1`) — AsyncOpenAI отправит запрос на `/chat/completions` минуя
+    нужный prefix, LM Studio вернёт 200 с пустым body и наш парсинг упадёт.
+
+    Правило: если URL не содержит path (только хост:порт) или path = `/` —
+    добавляем `/v1`. Иначе оставляем как есть (юзер мог явно указать `/v2`,
+    кастомный proxy и т.п.).
+    """
+    from urllib.parse import urlparse
+
+    if not url:
+        return url
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if not parsed.scheme:
+        return url
+    path = (parsed.path or "").strip("/")
+    if path == "":
+        return url.rstrip("/") + "/v1"
+    return url
+
+
 def _try_init(base_url: str, api_key: str, timeout_sec: int) -> bool:
     """Ленивая инициализация AsyncOpenAI. Падение → сохраняем причину
     в _init_error, релей продолжает работать без AI."""
@@ -42,8 +70,11 @@ def _try_init(base_url: str, api_key: str, timeout_sec: int) -> bool:
         log.warning("AI helper: %s", _init_error)
         return False
     try:
+        normalized_url = _normalize_base_url(base_url)
+        if normalized_url != base_url:
+            log.info("AI base URL normalized: %r → %r", base_url, normalized_url)
         _client = AsyncOpenAI(
-            base_url=base_url,
+            base_url=normalized_url,
             api_key=api_key or "lm-studio",
             timeout=timeout_sec,
         )
@@ -118,6 +149,7 @@ def list_models(base_url: str, api_key: str = "lm-studio",
     """
     import requests   # уже в зависимостях через meshtastic-python
 
+    base_url = _normalize_base_url(base_url)
     url = base_url.rstrip("/") + "/models"
     headers = {}
     if api_key:

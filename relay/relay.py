@@ -41,10 +41,23 @@ import logging
 import queue
 import re
 import sqlite3
+import sys
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
+
+# ── Encoding fix для Windows ─────────────────────────────────────────────────
+# По дефолту Python в Windows console использует cp1251 для stdout/stderr,
+# и кириллица превращается в "������" когда GUI читает stdout subprocess'а.
+# `reconfigure` доступен с Python 3.7+ и работает идемпотентно.
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except (AttributeError, OSError):
+    # AttributeError — старый Python; OSError — нестандартный stdout
+    # (PyInstaller noconsole редкий случай). В обоих кейсах продолжаем без фикса.
+    pass
 from typing import Optional
 
 import meshtastic

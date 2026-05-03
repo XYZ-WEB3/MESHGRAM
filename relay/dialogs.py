@@ -40,6 +40,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QRadioButton,
+    QScrollArea,
     QSpinBox,
     QStackedWidget,
     QTableWidget,
@@ -116,7 +117,11 @@ class SettingsDialog(QDialog):
                  open_section: str = "bot") -> None:
         super().__init__(parent)
         self.setWindowTitle("Настройки — relay/.env")
-        self.resize(880, 580)
+        # Минимум — чтобы footer с кнопками Save/Cancel никогда не обрезался,
+        # и sidebar с короткими лейблами не вылезал. Default — чуть с запасом
+        # чтоб длинная секция (AI с system prompt textarea) полностью видна.
+        self.setMinimumSize(900, 600)
+        self.resize(960, 660)
         self._data = settings_mod.load()
         self._touched = False
         self._build_ui()
@@ -151,10 +156,19 @@ class SettingsDialog(QDialog):
         self.sidebar.currentRowChanged.connect(self._on_sidebar)
         body.addWidget(self.sidebar)
 
-        # Stack
+        # Stack обёрнут в QScrollArea — длинные секции (AI, Mesh) с textarea'ами
+        # и группами иначе обрезаются по высоте при минимальном окне 900×600.
+        # Раньше юзер видел только верхнюю часть AI-секции, footer с Save был
+        # за пределами окна и не видно. Скролл решает это для любой высоты.
         self.stack = QStackedWidget()
         self.stack.setContentsMargins(0, 0, 0, 0)
-        body.addWidget(self.stack, 1)
+        scroll = QScrollArea()
+        scroll.setWidget(self.stack)
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        body.addWidget(scroll, 1)
 
         # Build sections
         self._sec_widgets: dict[str, QWidget] = {}
@@ -729,13 +743,14 @@ class SettingsDialog(QDialog):
         ))
 
         self.ed_ai_key = QLineEdit()
-        self.ed_ai_key.setPlaceholderText("lm-studio")
+        self.ed_ai_key.setPlaceholderText("любое значение, или оставь пустым")
         self.ed_ai_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.ed_ai_key.textChanged.connect(self._mark_touched)
         f_ep.addRow("API Key:", self.ed_ai_key)
         f_ep.addRow("", _hint(
-            "LM Studio принимает любой непустой ключ. Для облачных "
-            "провайдеров — реальный API key."
+            "Для LM Studio и Ollama локально — НЕ нужен, оставь пустым "
+            "или впиши что угодно. Реальный ключ требуется только для "
+            "облачных провайдеров (OpenAI, Anthropic и т.п.)."
         ))
         v.addWidget(gb_ep)
 

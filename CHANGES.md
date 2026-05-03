@@ -4,6 +4,42 @@
 
 ---
 
+## v0.7.4 — bug fixes (post-v0.7.3 hardening)
+
+После публикации v0.7.3 нашлись и пофикшены 6 багов которые мешали реальному использованию `.exe`-сборки. Все исправления в `relay/`, новых фич нет.
+
+### Кракозябры `������` в логах
+
+`relay.py` запускается как subprocess из GUI, и его stdout читается через `QProcess.readAllStandardOutput().decode("utf-8", errors="replace")`. На Windows Python по дефолту пишет в stdout в `cp1251` — кириллица превращается в кашу. Фикс: `sys.stdout.reconfigure(encoding="utf-8", errors="replace")` в самом начале `relay.py`. Теперь `[INFO] relay: Mesh RX from !1ba6795c: эээ` отображается читаемо.
+
+### GUI «Пользователи» пустой при работающем боте
+
+В `.exe`-сборке GUI открывал **другой** `relay.db` чем тот, в который пишет `relay.py`. Причина — `db.py` использовал `Path(__file__).with_name("relay.db")`, а `__file__` в PyInstaller-bundle указывает на распакованный временный `_MEIxxxx/db.py`, не на папку с `Meshgram.exe`. Тогда как `relay.py` через `paths.APP_DATA_DIR` правильно резолвит путь рядом с `.exe`. Mismatch → GUI читает пустой БД-файл. Фикс — `db.py` тоже использует `paths.APP_DATA_DIR`.
+
+### AI: «empty response» от LM Studio
+
+Юзер вписывает в Settings `Base URL: http://127.0.0.1:1234` (без `/v1`). AsyncOpenAI отправляет запрос на `/chat/completions` минуя prefix, LM Studio логирует `Unexpected endpoint or method. Returning 200 anyway` и отдаёт пустой body — наш парсинг падает с `RuntimeError("AI вернул пустой response")`. Фикс — `_normalize_base_url()` в `ai_helper.py` авто-добавляет `/v1` если path пустой. Любой `localhost:1234` или `127.0.0.1:1234` → `localhost:1234/v1` без правки `.env`.
+
+### Settings dialog обрезается, кнопок Save/Cancel не видно
+
+Длинные секции (особенно AI с system-prompt textarea и group'ами Endpoint/Model/Test) не помещались в дефолтный размер диалога 880×580. Footer с кнопками улетал за пределы экрана. Фикс — `QStackedWidget` обёрнут в `QScrollArea` (вертикальный скролл по необходимости), `setMinimumSize(900, 600)`, дефолт `resize(960, 660)`. Дополнительно — уточнённый hint у API key: «для LM Studio и Ollama НЕ нужен, оставь пустым».
+
+### Зомби-процессы Meshgram.exe после Quit через tray
+
+После закрытия GUI через tray-меню «Выйти» в Task Manager оставались 2 процесса `Meshgram.exe`. На Windows нет `PR_SET_PDEATHSIG` как на Linux — дочерние процессы не умирают автоматически когда родитель завершается. `QProcess.kill()` режет одного direct ребёнка, но если ребёнок уже породил grand-children (`meshtastic-python` спавнит USB-watcher thread'ы) — они зависают сиротами. Фикс — `_kill_self_tree()` через `psutil` обходит дерево потомков и убивает каждого. Подключён через `closeEvent` (для tray-quit) и `aboutToQuit` (для Ctrl+Q / system shutdown / exception в event-loop). Если psutil почему-то отсутствует — fallback на `taskkill /F /T /PID <my_pid>`.
+
+### Полный список изменённых файлов
+
+- `relay/relay.py` — encoding setup
+- `relay/db.py` — `paths.APP_DATA_DIR / "relay.db"` вместо `__file__`
+- `relay/ai_helper.py` — `_normalize_base_url()` + использование в `_try_init` и `list_models`
+- `relay/dialogs.py` — QScrollArea, minSize, API key hint
+- `relay/gui.py` — `_kill_self_tree()` + `aboutToQuit` hook + закрытие через psutil
+
+`Meshgram.exe` пересобран (74 MB), все 67 pytest тестов остались зелёными.
+
+---
+
 ## v0.7.3 — настройки в GUI, AI-конфиг, security audit
 
 ### Settings GUI: 4 новые секции

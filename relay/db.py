@@ -1,7 +1,14 @@
 """
-Read/write helpers for the GUI side. Shared by gui.py and dialogs.py.
-relay.py owns the same SQLite file at runtime — these functions open
-short-lived connections so concurrent access is safe.
+Read/write helpers для GUI-стороны. Используется gui.py и dialogs.py.
+relay.py владеет тем же SQLite-файлом в runtime — эти функции открывают
+кратковременные соединения, поэтому конкурентный доступ безопасен.
+
+DB_PATH через paths.APP_DATA_DIR — критично для PyInstaller-сборки:
+- В source-mode: рядом с db.py = relay/relay.db ✓
+- В frozen-mode (.exe): __file__ указывает на _MEIxxxx/db.py (распакованный
+  временный bundle), и `Path(__file__).with_name("relay.db")` дал бы
+  _MEIxxxx/relay.db — это пустой файл, GUI бы ничего там не видел.
+  Через APP_DATA_DIR — рядом с .exe, тот же файл что использует relay.py.
 """
 from __future__ import annotations
 
@@ -9,7 +16,9 @@ import sqlite3
 import time
 from pathlib import Path
 
-DB_PATH = Path(__file__).with_name("relay.db")
+import paths as _paths
+
+DB_PATH: Path = _paths.APP_DATA_DIR / "relay.db"
 
 
 # ---------------------------------------------------------------------------
