@@ -78,7 +78,7 @@ A bash launcher (`relay/run_relay.sh`) is provided as a convenience — it creat
 
 ### In progress
 
-- **Cloud mode (MQTT / TCP)** — instead of running `relay.py` locally, the user keeps only a Wi-Fi node on the windowsill; the relay process runs on the project's VPS. Scaffold is in [`cloud/`](cloud/) and the MQTT broker is deployed; integration is paused pending a stable Meshtastic firmware release. Removes the need for a local PC and, in regions with restricted Telegram access, the need for a local VPN.
+- **Cloud mode** — hosted variant where users keep only a Wi-Fi node at home and the relay runs on project infrastructure. End-to-end tests passing, in closed internal beta. Signup details will be announced separately.
 
 ### Planned
 
@@ -89,11 +89,15 @@ A bash launcher (`relay/run_relay.sh`) is provided as a convenience — it creat
 - **Distributable packages** — `.deb` for Debian/Ubuntu, AUR for Arch, PyInstaller bundle for Windows
 - **Localisation** — English and Spanish translations of the site, bot and CLI
 
+### Considered but parked
+
+- **MeshCore as a second mesh protocol** — promising newer LoRa-mesh stack with deterministic source-routed hops (more airtime-efficient than Meshtastic's flooding) and an official Python library with Serial/TCP/BLE transports out of the box. Considered for v0.8 with a `MESH_PROTOCOL=meshtastic|meshcore` switch and a unified `MeshInterface` adapter layer. Parked because Russia is not in MeshCore's official region/frequency list, there is no native mobile client comparable to Meshtastic's iOS/Android app, and the number of deployed MeshCore nodes in our target region is too low — a user spinning up Meshgram on MeshCore would likely have nobody to mesh with. Will revisit once the project gets traction in our region and ships a phone client.
+
 A more detailed roadmap and per-feature task list lives in [CHANGES.md](CHANGES.md). Architecture and command reference: [relay/README.md](relay/README.md).
 
 ## Stack
 
-Python 3.10+, PyQt6, python-telegram-bot, meshtastic-python, SQLite (WAL), Caddy + Let's Encrypt for the website, optional Mosquitto for the cloud mode.
+Python 3.10+, PyQt6, python-telegram-bot, meshtastic-python, SQLite (WAL), Caddy + Let's Encrypt for the website.
 
 ## Credits
 
