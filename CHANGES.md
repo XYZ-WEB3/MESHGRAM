@@ -4,6 +4,49 @@
 
 ---
 
+## v0.8.0 — `!ping`, `!history` и auto-recovery
+
+### Новые команды с карманной ноды
+
+`!ping` — короткий ответ `pong slots=N up=15m` чтобы быстро проверить что бот живой, помнит сколько слотов активно и сколько работает с последнего рестарта. Полезно когда не уверен прошёл ли последний deploy.
+
+`!history` (синоним `!last`) — последние сообщения в формате `hist 5h: | 14:30 @1 vasya: текст | 14:32 @1→: ответ |`. Аргументы:
+- `!history` — дефолт (8 сообщений за 5 часов)
+- `!history 5` — последние 5
+- `!history 3h` — за 3 часа
+- `!history 10 6h` — 10 за 6 часов
+
+Защитные пределы 24 часа / 20 сообщений (всё равно не помещается в 170-символьный LoRa-пакет). Сообщения старше `HISTORY_RETENTION_DAYS` (по умолчанию 7 дней) автоматически удаляются `expiry_worker`'ом раз в сутки.
+
+Имплементация — новая таблица `messages_recent (id, direction, slot_n, tg_user_id, text, ts)` с index по ts. Логирование на двух точках: `handle_text` (incoming TG → pocket) и slot_reply branch в `_handle_mesh_event` (outgoing pocket → TG-юзер).
+
+### Auto-recovery при потере USB-связи с нодой
+
+Раньше: USB unplug → меsh-iface молча умирает, релей продолжает крутиться вхолостую, юзер не знает.
+
+Теперь два защитных механизма:
+
+1. **`meshtastic.connection.lost` pubsub-event** — meshtastic-python публикует это при разрыве. Подписчик `_on_mesh_connection_lost` валит процесс через `os._exit(1)` — supervisor (systemd / GUI's QProcess) перезапустит чисто.
+2. **`mesh_watchdog` background-task** — раз в 30 секунд проверяет что `_mesh_iface.myInfo` не None. Если 3 раза подряд миссинг (90+ секунд тишины) — тоже жёсткий exit. Safety-net на случай «hard» отрыва когда event не пришёл.
+
+В `gui.py` — `_on_finished` callback автоматически рестартует relay через 5 секунд при exit_code != 0. Burst-protection: не больше 3 рестартов за 5 минут — после этого нужен ручной разбор. Юзер не должен сам кликать «Старт» при USB-плагине обратно.
+
+### Тесты
+
+19 новых unit-тестов в `tests/test_history.py`: parse args edge cases, log/get/purge messages_recent, ping payload format, history payload empty/full/truncate. **Итого 67 → 86 тестов**, все зелёные.
+
+### Settings новые
+
+```env
+HISTORY_DEFAULT_HOURS=5
+HISTORY_MAX_ITEMS=8
+HISTORY_RETENTION_DAYS=7
+```
+
+Все три — в Settings UI (новая группа «Pocket commands (!ping / !history)»).
+
+---
+
 ## v0.7.4 — bug fixes (post-v0.7.3 hardening)
 
 После публикации v0.7.3 нашлись и пофикшены 6 багов которые мешали реальному использованию `.exe`-сборки. Все исправления в `relay/`, новых фич нет.

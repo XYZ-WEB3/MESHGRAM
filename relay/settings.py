@@ -116,6 +116,16 @@ DEFAULTS: dict[str, Any] = {
     "retry_initial_delay_min":  2,
     "retry_max_interval_min":   15,
 
+    # --- Команды с pocket-ноды (`!ping`, `!history`/`!last`) ---
+    # Сколько часов истории показывает `!history` без явного аргумента.
+    "history_default_hours":    5,
+    # Максимум сообщений в одном ответе на `!history`. Лимит 170 симв на пакет
+    # = ~5-8 коротких записей помещается. Больше — обрезаем.
+    "history_max_items":        8,
+    # Сколько суток хранить messages_recent в БД до удаления expiry-worker'ом.
+    # Хранится только текст последних — никакой долгосрочной архивации.
+    "history_retention_days":   7,
+
     # --- Logging ---
     # Файл relay.log пишется рядом со скриптом. При log_file_enabled=False
     # бот пишет только в stdout (что подхватит GUI/journalctl).
@@ -166,6 +176,9 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Access", ["whitelist_enabled"]),
     ("SOS", ["sos_enabled", "sos_message", "sos_include_coords", "sos_recipients"]),
     ("Delivery / retry", ["retry_initial_delay_min", "retry_max_interval_min"]),
+    ("Pocket commands (!ping / !history)", [
+        "history_default_hours", "history_max_items", "history_retention_days",
+    ]),
     ("Logging", ["log_file_enabled", "log_file_max_mb", "log_file_keep"]),
     ("AI helper (LM Studio / Ollama / OpenAI-compatible)", [
         "ai_enabled", "ai_trigger_tag", "ai_base_url", "ai_api_key",
@@ -283,6 +296,8 @@ def validate(data: dict[str, Any]) -> list[str]:
                 "gps_fix_fresh_min", "gps_fix_stale_min", "gps_fix_max_min",
                 "where_rate_limit_min", "retry_initial_delay_min",
                 "retry_max_interval_min",
+                "history_default_hours", "history_max_items",
+                "history_retention_days",
                 "log_file_max_mb", "log_file_keep",
                 "mesh_hop_limit",
                 "ai_timeout_sec", "ai_max_history", "ai_ttl_hours"):

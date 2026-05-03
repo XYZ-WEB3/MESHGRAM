@@ -133,6 +133,11 @@ SOS_INCLUDE_COORDS: bool  = bool(_S["sos_include_coords"])
 RETRY_INITIAL_DELAY_MIN: int = int(_S["retry_initial_delay_min"])
 RETRY_MAX_INTERVAL_MIN: int  = int(_S["retry_max_interval_min"])
 
+# Команды с pocket-ноды — !history / !last
+HISTORY_DEFAULT_HOURS: int   = int(_S.get("history_default_hours") or 5)
+HISTORY_MAX_ITEMS: int       = int(_S.get("history_max_items") or 8)
+HISTORY_RETENTION_DAYS: int  = int(_S.get("history_retention_days") or 7)
+
 # Mesh: hop_limit на исходящих DM. 1 = direct only (без retransmit'ов через
 # другие ноды). Подходит для ближних случаев и снимает 5–15 с ожидания
 # окна ретрансляции. Поднять в .env (MESH_HOP_LIMIT=3) если pocket-нода
@@ -336,6 +341,21 @@ CREATE TABLE IF NOT EXISTS ai_messages (
 
 CREATE INDEX IF NOT EXISTS idx_aimsg_slot ON ai_messages(slot_n_ai);
 CREATE INDEX IF NOT EXISTS idx_aimsg_ts   ON ai_messages(ts);
+
+-- Recent messages for `!history` / `!last` команды с pocket-ноды.
+-- Direction: "in" = TG-юзер → pocket; "out" = pocket → TG-юзер. Все приватны
+-- для владельца pocket'а (он же сам читает через свой же canал). Таблица
+-- ротируется — записи старше HISTORY_RETENTION_DAYS удаляются expiry-worker'ом.
+CREATE TABLE IF NOT EXISTS messages_recent (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction   TEXT NOT NULL,             -- "in" | "out"
+    slot_n      INTEGER,                   -- может быть NULL (broadcast / SOS)
+    tg_user_id  INTEGER,                   -- может быть NULL (для outgoing replies)
+    text        TEXT NOT NULL,
+    ts          INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_msgrec_ts ON messages_recent(ts);
 """
 
 
@@ -602,6 +622,56 @@ def slot_list_active() -> list[dict]:
             (now,),
         )
         return [dict(row) for row in cur.fetchall()]
+
+
+# ---------- messages_recent (для !history / !last с pocket-ноды) ----------
+def messages_log(direction: str, *, slot_n: Optional[int],
+                 tg_user_id: Optional[int], text: str) -> None:
+    """Сохранить запись в messages_recent. Trim text до 200 симв (зачем больше
+    — для preview хватает, а длинные пакеты режутся при воспроизведении).
+
+    `direction` — "in" (TG → pocket) или "out" (pocket → TG)."""
+    if not text:
+        return
+    with _db_lock:
+        _db.execute(
+            "INSERT INTO messages_recent (direction, slot_n, tg_user_id, text, ts) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (direction, slot_n, tg_user_id, text[:200], _now()),
+        )
+        _db.commit()
+
+
+def messages_recent_get(hours: int, limit: int) -> list[dict]:
+    """Последние N сообщений за M часов — для команды !history.
+
+    Возвращает в порядке от старых к новым (естественный для чтения).
+    Текст уже trim'нут на 200 при записи. JOIN с users для имени отправителя.
+    """
+    cutoff = _now() - hours * 3600
+    with _db_lock:
+        cur = _db.execute(
+            "SELECT m.direction, m.slot_n, m.text, m.ts, "
+            "u.tg_username, u.first_name "
+            "FROM messages_recent m LEFT JOIN users u USING (tg_user_id) "
+            "WHERE m.ts >= ? ORDER BY m.ts DESC LIMIT ?",
+            (cutoff, limit),
+        )
+        rows = [dict(r) for r in cur.fetchall()]
+    rows.reverse()
+    return rows
+
+
+def messages_purge_old(retention_days: int) -> int:
+    """Удалить записи старше retention_days. Возвращает количество удалённых.
+    Вызывается из expiry_worker раз в сутки."""
+    cutoff = _now() - retention_days * 86400
+    with _db_lock:
+        cur = _db.execute(
+            "DELETE FROM messages_recent WHERE ts < ?", (cutoff,),
+        )
+        _db.commit()
+        return cur.rowcount or 0
 
 
 # ---------- entry_tag (deeplink category) ----------
@@ -933,6 +1003,10 @@ def _connect_mesh() -> meshtastic.serial_interface.SerialInterface:
     log.info("Connecting to local Meshtastic node over USB...")
     iface = meshtastic.serial_interface.SerialInterface(devPath=MESHTASTIC_PORT)
     pub.subscribe(on_mesh_receive, "meshtastic.receive")
+    # Лови потерю связи (USB unplug, ESP32 reboot и т.п.). meshtastic-python
+    # сам публикует `meshtastic.connection.lost` через PyPubSub. Мы валим
+    # процесс — supervisor (systemd / GUI's QProcess) перезапустит чисто.
+    pub.subscribe(_on_mesh_connection_lost, "meshtastic.connection.lost")
 
     global _my_node_num, _my_node_id
     # myInfo may take a moment to populate after connection.
@@ -946,6 +1020,22 @@ def _connect_mesh() -> meshtastic.serial_interface.SerialInterface:
 
     log.info("Mesh connected. HOME=%s, POCKET=%s", _my_node_id or "?", POCKET_NODE_ID)
     return iface
+
+
+def _on_mesh_connection_lost(*args, **kwargs) -> None:
+    """meshtastic-python pubsub callback при потере связи (USB unplug,
+    нода ребутнулась и т.п.). Жёстко валим процесс — supervisor (systemd /
+    GUI's QProcess в self-host, или systemd в cloud-mode) перезапустит чисто.
+
+    Альтернатива — partial reconnect через `_connect_mesh()` повторно — даёт
+    скрытые баги: какие-то pubsub-подписки задвоятся, какие-то state'ы
+    останутся stale. Хард-рестарт надёжнее и предсказуемее.
+    """
+    log.error("Mesh connection lost — exiting for supervisor restart")
+    # os._exit чтобы избежать атексит-хуков которые могут попробовать писать
+    # в уже мёртвый USB и зависнуть. Код 1 → supervisor видит crash → restart.
+    import os as _os
+    _os._exit(1)
 
 
 def on_mesh_receive(packet, interface) -> None:
@@ -1261,6 +1351,82 @@ def _reply_status_payload() -> str:
     return msg
 
 
+# Старт-таймстамп для !ping uptime. _RELAY_STARTED_AT инициализируется
+# при старте main(), но если кто-то импортирует модуль раньше — fallback.
+_RELAY_STARTED_AT: float = time.time()
+
+
+def _reply_ping_payload() -> str:
+    """Короткий ответ на `!ping` — бот жив + сколько слотов активно + uptime."""
+    slots_n = len(slot_list_active())
+    uptime_s = int(time.time() - _RELAY_STARTED_AT)
+    if uptime_s < 60:
+        up = f"{uptime_s}s"
+    elif uptime_s < 3600:
+        up = f"{uptime_s // 60}m"
+    elif uptime_s < 86400:
+        up = f"{uptime_s // 3600}h{(uptime_s % 3600) // 60}m"
+    else:
+        up = f"{uptime_s // 86400}d{(uptime_s % 86400) // 3600}h"
+    return f"pong slots={slots_n} up={up}"
+
+
+def _parse_history_args(args: str) -> tuple[int, int]:
+    """Парсит аргументы `!history` / `!last`.
+
+    Поддерживаемые форматы:
+        ""           → дефолты
+        "5"          → последние 5 сообщений (HISTORY_DEFAULT_HOURS hours)
+        "3h"         → за последние 3 часа (HISTORY_MAX_ITEMS limit)
+        "5 3h"       → 5 сообщений за 3 часа
+        "3h 5"       → 3 часа, 5 сообщений (порядок не важен)
+    Возвращает (hours, limit), оба ограничены защитными лимитами.
+    """
+    hours = HISTORY_DEFAULT_HOURS
+    limit = HISTORY_MAX_ITEMS
+    for tok in (args or "").split():
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        if tok.endswith("h") and tok[:-1].isdigit():
+            hours = int(tok[:-1])
+        elif tok.isdigit():
+            limit = int(tok)
+    # Защитные лимиты: не больше 24 часов и 20 сообщений (всё равно не помещается)
+    hours = max(1, min(hours, 24))
+    limit = max(1, min(limit, 20))
+    return hours, limit
+
+
+def _reply_history_payload(args: str) -> str:
+    """Форматирует ответ на `!history` / `!last`. Длинные пакеты режутся
+    по MAX_TEXT_LENGTH с пометкой `...`.
+
+    Формат записи: `HH:MM @N name: text` (in) или `HH:MM @N→: text` (out).
+    Отдельные записи разделены ' | ' чтобы влезало в один LoRa-пакет.
+    """
+    hours, limit = _parse_history_args(args)
+    rows = messages_recent_get(hours, limit)
+    if not rows:
+        return f"истор: пусто за {hours}h"
+    parts: list[str] = [f"hist {hours}h:"]
+    for r in rows:
+        ts_str = datetime.fromtimestamp(r["ts"]).strftime("%H:%M")
+        slot = r.get("slot_n")
+        slot_str = f"@{slot}" if slot else "—"
+        text = (r.get("text") or "").strip()
+        # Сокращаем имя/текст чтоб больше влезло в один пакет
+        if r["direction"] == "in":
+            name = (r.get("tg_username") or r.get("first_name") or "?")[:6]
+            parts.append(f"{ts_str} {slot_str} {name}: {text[:30]}")
+        else:
+            parts.append(f"{ts_str} {slot_str}→: {text[:30]}")
+    msg = " | ".join(parts)
+    if len(msg) > MAX_TEXT_LENGTH:
+        msg = msg[: MAX_TEXT_LENGTH - 3] + "..."
+    return msg
+
+
 def _reply_gps_payload() -> str:
     """Compact GPS state for !gps from pocket. BETA."""
     if not GPS_ENABLED:
@@ -1473,21 +1639,31 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
 
     if kind == "standalone_cmd":
         cmd = parsed["cmd"]
+        args = parsed.get("args", "")
         if cmd == "status":
             await send_dm_to_pocket_async(_reply_status_payload())
         elif cmd == "help":
-            help_msg = "@N текст=ответ. @N !ban=бан. !status. !help."
+            help_msg = (
+                "@N текст=ответ. @N !ban=бан. !status. !ping. "
+                "!history [Nh] [M]. !help."
+            )
             if GPS_ENABLED:
                 help_msg += " GPS(beta): @N !fav/!unfav, !gps, !favlist."
             if SOS_ENABLED:
                 help_msg += " #SOS текст = тревога."
             await send_dm_to_pocket_async(help_msg)
+        elif cmd == "ping":
+            await send_dm_to_pocket_async(_reply_ping_payload())
+        elif cmd in ("history", "last"):
+            await send_dm_to_pocket_async(_reply_history_payload(args))
         elif cmd == "gps":
             await send_dm_to_pocket_async(_reply_gps_payload())
         elif cmd == "favlist":
             await send_dm_to_pocket_async(_reply_favlist_payload())
         else:
-            await send_dm_to_pocket_async(f"!{cmd}? есть: !status, !help")
+            await send_dm_to_pocket_async(
+                f"!{cmd}? есть: !status, !ping, !history, !help"
+            )
         await _notify_owner(app, f"🎒 Команда с кармана: !{cmd}")
         return
 
@@ -1561,6 +1737,7 @@ async def _handle_mesh_event(app: Application, evt: dict) -> None:
             # shorter sticky TTL.
             slot_mark_replied(n)
             retry_delete_for_slot(n)
+            messages_log("out", slot_n=n, tg_user_id=tg_uid, text=reply_text)
             await _notify_owner(app, f"✅ @{n} → {user_display(tg_uid)}: {reply_text}")
         else:
             await send_dm_to_pocket_async(f"@{n} не доставлено")
@@ -1580,7 +1757,49 @@ async def mesh_dispatcher(app: Application) -> None:
             log.exception("Error in mesh dispatcher")
 
 
+async def mesh_watchdog(app: Application) -> None:
+    """Раз в 30 секунд проверяет что mesh-iface жив. Если 3 раза подряд
+    `myInfo` пропал (USB unplug, прошивка повисла) — жёстко валим процесс,
+    supervisor перезапустит. Это safety-net на случай если
+    `meshtastic.connection.lost` event не пришёл (бывает при «hard» отрыве).
+
+    Не делает partial reconnect внутри одного процесса — слишком много
+    скрытых state'ов в meshtastic-python (pubsub-подписки, USB-thread'ы,
+    кэши). Hard-restart надёжнее.
+    """
+    consecutive_misses = 0
+    while True:
+        try:
+            await asyncio.sleep(30)
+            iface = _mesh_iface
+            if iface is None:
+                continue
+            # Простая проверка: myInfo доступен (meshtastic это проп, который
+            # обновляется при каждом heartbeat-пакете). Если она None ровно
+            # после `_connect_mesh()` — это норма (ещё не поднялось), но если
+            # 3 раза подряд через 30 секунд — значит реально мертво.
+            my_info = getattr(iface, "myInfo", None)
+            if my_info is None:
+                consecutive_misses += 1
+                log.warning("mesh_watchdog: myInfo is None (%d/3)", consecutive_misses)
+                if consecutive_misses >= 3:
+                    log.error(
+                        "mesh_watchdog: mesh-iface dead 90+ seconds — exiting",
+                    )
+                    import os as _os
+                    _os._exit(1)
+            else:
+                consecutive_misses = 0
+        except asyncio.CancelledError:
+            return
+        except Exception:
+            log.exception("mesh_watchdog iteration failed")
+
+
 async def expiry_worker(app: Application) -> None:
+    # messages_recent purge — раз в сутки. Счётчик чтоб не делать каждую
+    # минуту (60 итераций * 60 = 3600 секунд = 1 час → 24 часа = 1440 итераций).
+    purge_counter = 0
     while True:
         try:
             freed = slot_expire_old()
@@ -1594,6 +1813,13 @@ async def expiry_worker(app: Application) -> None:
                 ai_freed = ai_expire_old(AI_TTL_HOURS)
                 if ai_freed:
                     log.info("Expired AI conversations: %s", ai_freed)
+            # messages_recent — раз в сутки (1440 минут)
+            purge_counter += 1
+            if purge_counter >= 1440:
+                purge_counter = 0
+                purged = messages_purge_old(HISTORY_RETENTION_DAYS)
+                if purged:
+                    log.info("Purged %d old messages_recent rows", purged)
         except Exception:
             log.exception("expiry_worker failed")
         await asyncio.sleep(60)
@@ -2350,6 +2576,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     # Allocate / reuse sticky slot (TASK-4).
     n, reused = slot_allocate_or_reuse(u.id)
     slot_set_last_message(n, text)
+    messages_log("in", slot_n=n, tg_user_id=u.id, text=text)
     tag = user_get_entry_tag(u.id)
     single_payload = _format_lora_packet(n, u, text, entry_tag=tag)
 
@@ -2506,6 +2733,7 @@ async def on_post_init(app: Application) -> None:
     asyncio.create_task(mesh_dispatcher(app))
     asyncio.create_task(expiry_worker(app))
     asyncio.create_task(retry_worker(app))
+    asyncio.create_task(mesh_watchdog(app))   # USB-unplug detection
     log.info(
         "Relay ready. Owner=%s, Pocket=%s, Home=%s",
         OWNER_ID, POCKET_NODE_ID, _my_node_id,
@@ -2629,7 +2857,8 @@ def _run_polling_with_retry() -> None:
 
 
 def main() -> None:
-    global _mesh_iface, MESHTASTIC_PORT
+    global _mesh_iface, MESHTASTIC_PORT, _RELAY_STARTED_AT
+    _RELAY_STARTED_AT = time.time()  # для !ping uptime
 
     parser = argparse.ArgumentParser()
     parser.add_argument(

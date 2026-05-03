@@ -783,6 +783,40 @@ class Relay(QMainWindow):
         self.console.append_raw(f"{self._ts()}{tag} Процесс завершён (код {exit_code})\n\n")
         self.process = None
         self._refresh_status()
+        # Авто-рестарт при ненормальном завершении. Это покрывает crash из
+        # mesh_watchdog (USB unplug → relay делает os._exit(1)) и любые
+        # uncaught exceptions в relay.py. Юзер не должен сам кликать Старт.
+        # Защита от burst'а: если за последние 5 минут было >= 3 рестартов,
+        # ставим паузу — что-то реально сломано, нужен ручной разбор.
+        if exit_code != 0 and not self._quit_requested:
+            now = time.time()
+            self._restart_history = [t for t in getattr(self, "_restart_history", [])
+                                     if now - t < 300]
+            if len(self._restart_history) < 3:
+                self._restart_history.append(now)
+                self.console.append_raw(
+                    f"{self._ts()}↻ Авто-рестарт через 5 сек "
+                    f"(попытка {len(self._restart_history)}/3)\n"
+                )
+                QTimer.singleShot(5000, self._auto_restart_relay)
+            else:
+                self.console.append_raw(
+                    f"{self._ts()}⚠ Слишком много рестартов за 5 минут "
+                    "(3+). Авто-рестарт отключён, нужен ручной разбор.\n"
+                )
+
+    def _auto_restart_relay(self) -> None:
+        """Перезапуск relay'я если он крашнулся. Вызывается из QTimer."""
+        if self.process is not None or self._quit_requested:
+            return  # уже стартовал вручную или закрываемся
+        port = self._cfg.get("last_com_port") or ""
+        if not port:
+            self.console.append_raw(
+                f"{self._ts()}⚠ Авто-рестарт: COM-порт не задан, отмена\n"
+            )
+            return
+        self.console.append_raw(f"{self._ts()}↻ Авто-рестарт relay на {port}\n")
+        self._start()
 
     def closeEvent(self, ev) -> None:
         L = self._cfg.get("gui_lang", "ru")
