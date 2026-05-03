@@ -78,7 +78,7 @@ python relay.py --port /dev/ttyUSB0   # Linux / macOS
 
 ### В работе
 
-- **Cloud-режим (MQTT / TCP)** — вместо локального `relay.py` пользователь держит только Wi-Fi-ноду на подоконнике, а relay-процесс работает на VPS проекта. Скелет лежит в [`cloud/`](cloud/), MQTT-брокер развёрнут; интеграция приостановлена до выхода стабильной прошивки Meshtastic. Снимает требование иметь локальный ПК и, в регионах с ограниченным доступом к Telegram, локальный VPN.
+- **Cloud-режим** — облачный вариант: пользователь держит только Wi-Fi-ноду дома, relay работает на инфраструктуре проекта. E2E-тесты пройдены, идёт закрытая внутренняя бета. Детали регистрации будут анонсированы отдельно.
 
 ### В планах
 
@@ -89,11 +89,15 @@ python relay.py --port /dev/ttyUSB0   # Linux / macOS
 - **Готовые пакеты** — `.deb` для Debian/Ubuntu, AUR для Arch, PyInstaller-бандл для Windows
 - **Локализация** — английская и испанская версии сайта, бота и CLI
 
+### Рассматривали и отложили
+
+- **MeshCore как второй mesh-протокол** — перспективный новый LoRa-mesh-стек с детерминированной source-routed маршрутизацией (эффективнее по эфирному времени, чем flooding в Meshtastic), с официальной Python-библиотекой и встроенными Serial / TCP / BLE-транспортами. Рассматривали для v0.8 с переключателем `MESH_PROTOCOL=meshtastic|meshcore` и абстракцией `MeshInterface`. Отложили: в официальном списке регионов MeshCore нет России, нет нативного мобильного клиента уровня Meshtastic (iOS/Android), и в нашем регионе развёрнутых MeshCore-нод слишком мало — пользователь, поднимающий Meshgram поверх MeshCore, просто не с кем будет переписываться. Вернёмся к идее, когда проект наберёт массу в РФ и появится клиент под смартфон.
+
 Подробный roadmap с разбивкой по задачам — в [CHANGES.md](CHANGES.md). Архитектура и справочник команд — в [relay/README.md](relay/README.md).
 
 ## Стек
 
-Python 3.10+, PyQt6, python-telegram-bot, meshtastic-python, SQLite (WAL), Caddy + Let's Encrypt для сайта, опционально Mosquitto для cloud-режима.
+Python 3.10+, PyQt6, python-telegram-bot, meshtastic-python, SQLite (WAL), Caddy + Let's Encrypt для сайта.
 
 ## Кредиты
 
