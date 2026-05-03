@@ -61,6 +61,11 @@ a = Analysis(
         "openai._client",
         # Pillow / SVG для иконки
         "PIL.Image",
+        # psutil — нужен для _kill_self_tree() в gui.py (убивает зомби-процессы
+        # после quit). Импорт внутри функции под try/except → PyInstaller
+        # автоматом не подхватывает. Без него fallback на taskkill /F /T,
+        # это медленнее и иногда не успевает за shutdown.
+        "psutil",
     ],
     hookspath=[],
     hooksconfig={},
