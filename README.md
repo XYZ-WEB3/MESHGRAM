@@ -78,7 +78,7 @@ A bash launcher (`relay/run_relay.sh`) is provided as a convenience — it creat
 
 ### In progress
 
-- **Cloud mode** — hosted variant where users keep only a Wi-Fi node at home and the relay runs on project infrastructure. End-to-end tests passing, in closed internal beta. Signup details will be announced separately.
+- **Cloud mode** — hosted variant where users keep only a Wi-Fi node at home and the relay runs on project infrastructure. End-to-end tests passing, **closed beta with 25 slots** — live counter and waitlist on [meshgram.site](https://meshgram.site). Public signup will be announced separately once it stabilizes.
 
 ### Planned
 
